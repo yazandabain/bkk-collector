@@ -1,0 +1,21 @@
+services:
+  collector:
+    build: .
+    container_name: bkk_collector
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    # Keeps memory/CPU use predictable on a small VM -- generous for this workload.
+    # Raised from 512m: the pre-fix collector could buffer up to ~200k
+    # unfiltered TripUpdates rows in memory between flushes, and running a
+    # second diagnostic python process in the same container on top of that
+    # hit the limit and got OOM-killed (exit code 137). Your CX22 has 4GB
+    # total, so 1.5GB still leaves plenty of headroom for the OS + Docker.
+    mem_limit: 1536m
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
