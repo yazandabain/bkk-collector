@@ -1,0 +1,31 @@
+# SECRETS -- never commit. .env holds your BKK API key, HF write token, and
+# healthcheck URL. .env.example is the safe, placeholder-only template that
+# IS committed.
+.env
+*.key
+*.pem
+
+# COLLECTED DATA -- lives on the VM and Hugging Face, not in git. Committing
+# it would blow past GitHub's file size limits within a day and make the repo
+# unusable.
+data/
+*.parquet
+*.rawlog
+*.pb
+budapest_gtfs*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
