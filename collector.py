@@ -1,414 +1,478 @@
-"""
-BKK FUTAR realtime collector.
+"""BKK GTFS-Realtime collector hot path.
 
-Every POLL_INTERVAL_SECONDS, fetches VehiclePositions, TripUpdates and Alerts,
-writes the raw bytes to a gzip-appended log (see raw_log.py -- this is the
-part that can never be recreated), parses them into rows, and periodically
-flushes those rows to date-partitioned Parquet files. Once a day it uploads
-the previous day's data to a Hugging Face dataset repo, and once a month it
-re-downloads the static GTFS schedule zip.
-
-Run it: `python collector.py`, or via Docker (see Dockerfile / docker-compose.yml).
-Config is entirely via environment variables -- see .env.example.
+This process only fetches and durably stores realtime observations. Remote
+backup, static GTFS, compaction, pruning, and external monitoring run in the
+separate maintenance process so they can never delay a poll.
 """
 
 from __future__ import annotations
 
-import gzip
+import hashlib
 import logging
 import logging.handlers
-import os
+import re
 import shutil
 import signal
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-from gtfs_rt_parse import PARSERS, parse_feed
-from raw_log import append_record
+from config import CollectorConfig, FEED_NAMES, feed_urls
 from dedup import ChangeTracker
+from gtfs_rt_parse import PARSERS, parse_feed
+from monitoring import HealthMonitor, append_poll_event, entity_timestamp_range, utc_iso
+from parquet_store import DurableParquetSpool
+from raw_log import append_record, repair_truncated_tail
 
-# --------------------------------------------------------------------------
-# Configuration (all from environment -- nothing here should need editing)
-# --------------------------------------------------------------------------
 
-API_KEY = os.environ["BKK_API_KEY"]  # required, will KeyError loudly if missing
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
-POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
-PARQUET_FLUSH_MINUTES = int(os.environ.get("PARQUET_FLUSH_MINUTES", "5"))
-BACKUP_HOUR_UTC = int(os.environ.get("BACKUP_HOUR_UTC", "3"))
-DISK_WARN_FREE_GB = float(os.environ.get("DISK_WARN_FREE_GB", "2.0"))
-
-# TripUpdates is measured at ~5MB per poll for the Budapest network (BKK
-# retransmits full remaining-stop predictions for every active trip on every
-# poll). Polling every 30s is still cheap; ARCHIVING every 30s is not --
-# unthrottled that's ~14GB/day uncompressed. So: keep polling frequent for
-# freshness, but only persist rows/raw-snapshots when something changed.
-TRIPUPDATES_RAW_ARCHIVE_SECONDS = int(os.environ.get("TRIPUPDATES_RAW_ARCHIVE_SECONDS", "300"))
-
-# BKK recalculates ETAs continuously off live GPS, so arrival_delay/departure_delay
-# can shift by a couple of seconds on nearly every poll even when nothing
-# meaningfully changed -- exact-equality dedup treats that jitter as a real
-# change. Anything moving by less than this many seconds doesn't count as
-# "changed" for storage purposes (the raw, un-rounded value is still what
-# gets stored in any row that IS written -- this only affects what triggers
-# a write).
-DELAY_CHANGE_THRESHOLD_SECONDS = int(os.environ.get("DELAY_CHANGE_THRESHOLD_SECONDS", "15"))
-HEARTBEAT_SECONDS = int(os.environ.get("HEARTBEAT_SECONDS", "1800"))
-
-# The VM's disk only needs to hold a rolling buffer -- Hugging Face holds the
-# real multi-month history. Once a date's raw files are confirmed backed up
-# AND older than this many days, they're deleted locally. Parquet (much
-# smaller) is never auto-pruned. Set to 0 to disable pruning entirely.
-PRUNE_LOCAL_RAW_AFTER_DAYS = int(os.environ.get("PRUNE_LOCAL_RAW_AFTER_DAYS", "14"))
-
-# Dead-man's switch. If set, the collector pings this URL after every
-# successful Parquet flush. Configure the check with a period longer than
-# PARQUET_FLUSH_MINUTES (e.g. 1 hour) and healthchecks.io emails you when
-# the pings STOP -- which is what catches the silent failures that a
-# `restart: unless-stopped` container can't: a revoked API key, a stuck
-# restart loop, a full disk. Optional; unset means no pinging.
-HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "").strip()
-
-# Per-feed minimum gap between raw archive writes. Unset (0) = archive every poll.
-RAW_ARCHIVE_INTERVAL = {
-    "vehiclepositions": 0,
-    "alerts": 0,
-    "tripupdates": TRIPUPDATES_RAW_ARCHIVE_SECONDS,
-}
-
-HF_TOKEN = os.environ.get("HF_TOKEN")  # optional -- backup disabled if unset
-HF_REPO_ID = os.environ.get("HF_REPO_ID")  # e.g. "yourname/bkk-transit-raw"
-
-FEEDS = {
-    "vehiclepositions": f"https://go.bkk.hu/api/query/v1/ws/gtfs-rt/full/VehiclePositions.pb?key={API_KEY}",
-    "tripupdates": f"https://go.bkk.hu/api/query/v1/ws/gtfs-rt/full/TripUpdates.pb?key={API_KEY}",
-    "alerts": f"https://go.bkk.hu/api/query/v1/ws/gtfs-rt/full/Alerts.pb?key={API_KEY}",
-}
-STATIC_GTFS_URL = "https://go.bkk.hu/api/static/v1/public-gtfs/budapest_gtfs.zip"
-
-RAW_DIR = DATA_DIR / "raw"
-PARQUET_DIR = DATA_DIR / "parquet"
-STATIC_DIR = DATA_DIR / "static_gtfs"
-LOG_DIR = DATA_DIR / "logs"
-STATE_FILE = DATA_DIR / "collector_state.txt"  # tiny file: last backup date, last static-download month
-BACKUP_SUCCESS_FILE = DATA_DIR / "backup_success_dates.txt"  # append-only list of dates confirmed on HF
-
-# --------------------------------------------------------------------------
-# Logging -- to both stdout (docker logs) and a rotating file (readable even
-# without docker, and survives container restarts since DATA_DIR is a volume)
-# --------------------------------------------------------------------------
-
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-logger = logging.getLogger("bkk_collector")
-logger.setLevel(logging.INFO)
-_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-_stream = logging.StreamHandler(sys.stdout)
-_stream.setFormatter(_fmt)
-_file = logging.handlers.RotatingFileHandler(LOG_DIR / "collector.log", maxBytes=10_000_000, backupCount=5)
-_file.setFormatter(_fmt)
-logger.addHandler(_stream)
-logger.addHandler(_file)
-
-session = requests.Session()
-session.headers.update({"User-Agent": "bkk-collector/1.0 (personal transit research project)"})
-
+LOGGER = logging.getLogger("bkk_collector")
 _shutdown_requested = False
 
 
-def _handle_signal(signum, frame):
+def configure_logging(data_dir: Path, process_name: str = "collector") -> logging.Logger:
+    log_dir = data_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(f"bkk_{process_name}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if logger.handlers:
+        return logger
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(formatter)
+    rotating = logging.handlers.RotatingFileHandler(
+        log_dir / f"{process_name}.log", maxBytes=10_000_000, backupCount=5
+    )
+    rotating.setFormatter(formatter)
+    logger.addHandler(stream)
+    logger.addHandler(rotating)
+    return logger
+
+
+def _handle_signal(signum, _frame) -> None:
     global _shutdown_requested
-    logger.info("Received signal %s, will flush and exit after this cycle.", signum)
+    LOGGER.info("Received signal %s; finishing durable local writes before exit.", signum)
     _shutdown_requested = True
 
 
-signal.signal(signal.SIGTERM, _handle_signal)
-signal.signal(signal.SIGINT, _handle_signal)
+@dataclass(frozen=True)
+class FetchResult:
+    feed_name: str
+    poll_id: str
+    request_started_at: str
+    request_started_ts: float
+    response_received_at: str
+    response_received_ts: float
+    latency_ms: float
+    http_status: int | None
+    payload: bytes | None
+    error: str | None
 
 
-# --------------------------------------------------------------------------
-# State (which date we last backed up, which month we last fetched static GTFS)
-# --------------------------------------------------------------------------
-
-def load_state() -> dict:
-    state = {"last_backup_date": "", "last_static_month": ""}
-    if STATE_FILE.exists():
-        for line in STATE_FILE.read_text().splitlines():
-            if "=" in line:
-                k, v = line.split("=", 1)
-                state[k] = v
-    return state
+def _redact_error(error: BaseException, api_key: str) -> str:
+    message = str(error).replace(api_key, "<redacted>") if api_key else str(error)
+    message = re.sub(r"([?&]key=)[^&\s]+", r"\1<redacted>", message, flags=re.IGNORECASE)
+    return f"{type(error).__name__}: {message}"[:1000]
 
 
-def save_state(state: dict) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text("\n".join(f"{k}={v}" for k, v in state.items()))
+def _new_session(config: CollectorConfig) -> requests.Session:
+    retry = Retry(
+        total=config.http_connect_retries,
+        connect=config.http_connect_retries,
+        read=config.http_connect_retries,
+        status=0,
+        redirect=0,
+        other=0,
+        backoff_factor=config.http_backoff_seconds,
+        allowed_methods=frozenset({"GET"}),
+        respect_retry_after_header=False,
+        raise_on_status=False,
+    )
+    session = requests.Session()
+    session.headers.update({"User-Agent": "bkk-collector/2 (transit research archival)"})
+    session.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=1, pool_maxsize=1))
+    return session
 
 
-# --------------------------------------------------------------------------
-# Parquet buffering
-# --------------------------------------------------------------------------
+class Collector:
+    def __init__(self, config: CollectorConfig):
+        self.config = config
+        self.logger = configure_logging(config.data_dir, "collector")
+        global LOGGER
+        LOGGER = self.logger
+        self.urls = feed_urls(config.api_key)
+        self.sessions = {feed_name: _new_session(config) for feed_name in FEED_NAMES}
+        self.executor = ThreadPoolExecutor(max_workers=len(FEED_NAMES), thread_name_prefix="bkk-fetch")
+        self.spool = DurableParquetSpool(config.data_dir, config.parquet_flush_seconds)
+        self.monitor = HealthMonitor(
+            config.data_dir,
+            stale_seconds=config.feed_stale_seconds,
+            absent_seconds=config.feed_absent_seconds,
+            frozen_seconds=config.frozen_payload_seconds,
+            alerts_frozen_seconds=config.alerts_frozen_payload_seconds,
+        )
+        self.last_raw_archive_monotonic = {feed_name: 0.0 for feed_name in FEED_NAMES}
+        self.raw_needs_repair: set[Path] = set()
+        self.trackers = self._make_trackers()
 
-_buffers: dict[str, list[dict]] = {name: [] for name in FEEDS}
-_last_flush = time.monotonic()
-_last_raw_archive: dict[str, float] = {name: 0.0 for name in FEEDS}
+    def _make_trackers(self) -> dict[str, ChangeTracker]:
+        return {
+            "tripupdates": ChangeTracker(
+                key_fields=(
+                    "entity_id", "trip_id", "start_date", "start_time", "stop_sequence",
+                    "stop_visit_fallback_index", "stop_id",
+                ),
+                value_fields=(
+                    "route_id", "direction_id", "schedule_relationship", "vehicle_id",
+                    "stop_schedule_relationship", "departure_occupancy_status", "stop_time_properties_json",
+                    "arrival_uncertainty", "departure_uncertainty",
+                    "bkk_scheduled_arrival_time", "bkk_scheduled_departure_time",
+                ),
+                numeric_tolerance_fields=(
+                    "arrival_delay", "departure_delay", "trip_delay", "arrival_time", "departure_time",
+                ),
+                tolerance=self.config.delay_change_threshold_seconds,
+                heartbeat_seconds=self.config.heartbeat_seconds,
+            ),
+            "alerts": ChangeTracker(
+                key_fields=(
+                    "entity_id", "affected_agency_id", "affected_route_id", "affected_route_type",
+                    "affected_stop_id", "affected_direction_id", "affected_trip_id",
+                    "affected_trip_start_date", "affected_trip_start_time",
+                ),
+                value_fields=(
+                    "cause", "effect", "severity_level", "header_text_json", "description_text_json",
+                    "url_json", "active_periods_json", "communication_periods_json", "impact_periods_json",
+                    "informed_entities_json", "bkk_start_text_json", "bkk_end_text_json",
+                    "bkk_modified_time", "bkk_route_details_json",
+                ),
+                heartbeat_seconds=self.config.heartbeat_seconds,
+            ),
+        }
 
-
-# VehiclePositions isn't tracked: a vehicle's lat/lon is essentially always
-# different from the last poll, so dedup wouldn't help and the feed is cheap
-# anyway (~190KB). TripUpdates and Alerts are the high-redundancy ones.
-_trackers = {
-    "tripupdates": ChangeTracker(
-        key_fields=("trip_id", "start_date", "stop_id"),
-        numeric_tolerance_fields=("arrival_delay", "departure_delay", "trip_delay"),
-        tolerance=DELAY_CHANGE_THRESHOLD_SECONDS,
-        heartbeat_seconds=HEARTBEAT_SECONDS,
-    ),
-    "alerts": ChangeTracker(
-        key_fields=("entity_id", "affected_route_id", "affected_stop_id", "affected_trip_id"),
-        value_fields=("cause", "effect", "header_text", "description_text", "active_period_start", "active_period_end"),
-        heartbeat_seconds=HEARTBEAT_SECONDS,
-    ),
-}
-
-
-def ping_healthcheck() -> None:
-    """Signals 'still alive AND still collecting'. Deliberately called only
-    after a flush that actually wrote rows -- if BKK revokes the key or the
-    feeds go empty, the buffers stay empty, no ping is sent, and the check
-    fires. A ping that merely proved the process was running would report
-    healthy in exactly the failure case you most need to hear about."""
-    if not HEALTHCHECK_URL:
-        return
-    try:
-        session.get(HEALTHCHECK_URL, timeout=10)
-    except Exception as e:
-        # Never let monitoring break collection.
-        logger.warning("Healthcheck ping failed (collection unaffected): %s", e)
-
-
-def flush_parquet(force: bool = False) -> None:
-    global _last_flush
-    elapsed_min = (time.monotonic() - _last_flush) / 60
-    if not force and elapsed_min < PARQUET_FLUSH_MINUTES:
-        return
-    import pandas as pd  # local import keeps startup fast if pandas is slow to import
-
-    now = datetime.now(timezone.utc)
-    wrote_anything = False
-    for feed_name, rows in _buffers.items():
-        if not rows:
-            continue
-        df = pd.DataFrame(rows)
-        out_dir = PARQUET_DIR / feed_name / f"date={now:%Y-%m-%d}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"part-{now:%H%M%S}.parquet"
-        try:
-            df.to_parquet(out_path, index=False, compression="zstd")
-            logger.info("Flushed %d rows -> %s", len(rows), out_path)
-            wrote_anything = True
-        except Exception:
-            logger.exception("Failed writing Parquet for %s (raw data is still safe on disk)", feed_name)
-        _buffers[feed_name] = []
-    _last_flush = time.monotonic()
-
-    if wrote_anything:
-        ping_healthcheck()
-
-
-# --------------------------------------------------------------------------
-# One poll cycle
-# --------------------------------------------------------------------------
-
-def poll_once() -> None:
-    now = datetime.now(timezone.utc)
-    fetched_at = now.isoformat()
-
-    for feed_name, url in FEEDS.items():
-        try:
-            resp = session.get(url, timeout=15)
-            resp.raise_for_status()
-            raw_bytes = resp.content
-        except Exception as e:
-            logger.warning("Fetch failed for %s: %s", feed_name, e)
-            continue
-
-        # Archive the raw bytes FIRST, before attempting to parse anything.
-        # A parsing bug must never cost us the underlying data. Throttled per
-        # feed (see RAW_ARCHIVE_INTERVAL) so TripUpdates doesn't write a fresh
-        # ~5MB snapshot every 30 seconds -- see README for the math.
-        min_gap = RAW_ARCHIVE_INTERVAL.get(feed_name, 0)
-        if now.timestamp() - _last_raw_archive[feed_name] >= min_gap:
-            raw_path = RAW_DIR / feed_name / f"date={now:%Y-%m-%d}" / f"{feed_name}.rawlog"
+    def recover_current_raw_tails(self) -> None:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for feed_name in FEED_NAMES:
+            path = self.config.data_dir / "raw" / feed_name / f"date={today}" / f"{feed_name}.rawlog"
             try:
-                append_record(raw_path, now.timestamp(), raw_bytes)
-                _last_raw_archive[feed_name] = now.timestamp()
+                recovery = repair_truncated_tail(path)
             except Exception:
-                logger.exception("CRITICAL: failed to write raw archive for %s -- check disk space now", feed_name)
+                self.raw_needs_repair.add(path)
+                self.logger.exception("CRITICAL: could not validate current raw log tail for %s", feed_name)
+            else:
+                if recovery:
+                    self.logger.error("Detached an invalid raw-log tail to %s before resuming appends", recovery)
 
+    def fetch_feed(self, feed_name: str, poll_id: str) -> FetchResult:
+        started_ts = time.time()
+        started = utc_iso(started_ts)
+        monotonic_start = time.monotonic()
+        response = None
         try:
-            feed = parse_feed(raw_bytes)
-            rows = PARSERS[feed_name](feed, fetched_at)
-            tracker = _trackers.get(feed_name)
-            if tracker is not None:
-                rows = tracker.filter(rows, f"{now:%Y-%m-%d}", now.timestamp())
-            _buffers[feed_name].extend(rows)
-        except Exception:
-            logger.exception("Failed to parse %s this cycle (raw bytes were still archived on their own schedule)", feed_name)
-
-
-def check_disk_space() -> None:
-    total, used, free = shutil.disk_usage(DATA_DIR if DATA_DIR.exists() else "/")
-    free_gb = free / 1e9
-    if free_gb < DISK_WARN_FREE_GB:
-        logger.error(
-            "LOW DISK SPACE: only %.2f GB free. Collector will keep running but will "
-            "eventually crash if this isn't fixed -- prune old local raw files once "
-            "they're confirmed backed up (see rebuild_parquet.py / README).",
-            free_gb,
+            response = self.sessions[feed_name].get(
+                self.urls[feed_name],
+                timeout=(self.config.connect_timeout_seconds, self.config.read_timeout_seconds),
+            )
+            received_ts = time.time()
+            received = utc_iso(received_ts)
+            status = response.status_code
+            response.raise_for_status()
+            payload = response.content
+            error = None
+        except Exception as exc:
+            received_ts = time.time()
+            received = utc_iso(received_ts)
+            status = response.status_code if response is not None else None
+            payload = None
+            error = _redact_error(exc, self.config.api_key)
+        return FetchResult(
+            feed_name=feed_name,
+            poll_id=poll_id,
+            request_started_at=started,
+            request_started_ts=started_ts,
+            response_received_at=received,
+            response_received_ts=received_ts,
+            latency_ms=(time.monotonic() - monotonic_start) * 1000,
+            http_status=status,
+            payload=payload,
+            error=error,
         )
 
+    def _raw_path(self, feed_name: str, date_str: str) -> Path:
+        return self.config.data_dir / "raw" / feed_name / f"date={date_str}" / f"{feed_name}.rawlog"
 
-# --------------------------------------------------------------------------
-# Daily backup to Hugging Face, monthly static GTFS refresh
-# --------------------------------------------------------------------------
-
-def maybe_backup_and_refresh(state: dict) -> None:
-    now = datetime.now(timezone.utc)
-    today = f"{now:%Y-%m-%d}"
-    yesterday = f"{(now - timedelta(days=1)):%Y-%m-%d}"
-    this_month = f"{now:%Y-%m}"
-
-    if now.hour >= BACKUP_HOUR_UTC and state.get("last_backup_date") != today:
-        flush_parquet(force=True)
-        if HF_TOKEN and HF_REPO_ID:
-            if backup_date_to_hf(yesterday):
-                mark_backup_success(yesterday)
-        else:
-            logger.info("HF_TOKEN/HF_REPO_ID not set -- skipping cloud backup. Data is still safe locally.")
-        state["last_backup_date"] = today
-        save_state(state)
-        prune_old_local_raw()
-
-    if state.get("last_static_month") != this_month:
-        download_static_gtfs()
-        state["last_static_month"] = this_month
-        save_state(state)
-
-
-def backup_date_to_hf(date_str: str) -> bool:
-    try:
-        from huggingface_hub import HfApi
-
-        api = HfApi(token=HF_TOKEN)
-        api.create_repo(repo_id=HF_REPO_ID, repo_type="dataset", exist_ok=True, private=True)
-        for base in (RAW_DIR, PARQUET_DIR):
-            for feed_name in FEEDS:
-                local_dir = base / feed_name / f"date={date_str}"
-                if not local_dir.exists():
+    def _archive_raw(self, result: FetchResult, date_str: str, *, force: bool = False) -> tuple[bool, bool, str | None]:
+        assert result.payload is not None
+        interval = self.config.raw_archive_intervals[result.feed_name]
+        now_monotonic = time.monotonic()
+        due = force or now_monotonic - self.last_raw_archive_monotonic[result.feed_name] >= interval
+        if not due:
+            return False, True, None
+        raw_path = self._raw_path(result.feed_name, date_str)
+        try:
+            for pending_path in list(self.raw_needs_repair):
+                if pending_path.parent.parent.name != result.feed_name:
                     continue
-                remote_prefix = f"{base.name}/{feed_name}/date={date_str}"
-                api.upload_folder(
-                    repo_id=HF_REPO_ID,
-                    repo_type="dataset",
-                    folder_path=str(local_dir),
-                    path_in_repo=remote_prefix,
-                )
-        logger.info("Backed up %s to hf.co/datasets/%s", date_str, HF_REPO_ID)
-        return True
-    except Exception:
-        logger.exception("HF backup failed for %s -- local copy is untouched, will not retry until tomorrow "
-                          "and will NOT be pruned locally until a backup succeeds. Fix credentials/network.", date_str)
-        return False
+                recovery = repair_truncated_tail(pending_path)
+                if recovery:
+                    self.logger.error("Detached failed raw append tail to %s before retry", recovery)
+                self.raw_needs_repair.discard(pending_path)
+            append_record(raw_path, result.response_received_ts, result.payload, fsync=self.config.raw_fsync)
+            self.last_raw_archive_monotonic[result.feed_name] = now_monotonic
+            return True, True, str(raw_path.relative_to(self.config.data_dir))
+        except Exception as error:
+            self.raw_needs_repair.add(raw_path)
+            self.logger.exception("CRITICAL: raw archive write failed for %s", result.feed_name)
+            return False, False, _redact_error(error, self.config.api_key)
 
+    def _failure_event(self, result: FetchResult) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "poll_id": result.poll_id,
+            "feed": result.feed_name,
+            "poll_interval_seconds": self.config.poll_interval_seconds,
+            "request_started_at": result.request_started_at,
+            "response_received_at": result.response_received_at,
+            "http_status": result.http_status,
+            "latency_ms": round(result.latency_ms, 3),
+            "success": False,
+            "error": result.error,
+            "payload_size": None,
+            "payload_sha256": None,
+            "raw_due": False,
+            "raw_archived": False,
+            "parse_ok": False,
+            "parsed_rows": 0,
+            "emitted_rows": 0,
+        }
 
-def mark_backup_success(date_str: str) -> None:
-    with open(BACKUP_SUCCESS_FILE, "a") as f:
-        f.write(date_str + "\n")
-
-
-def backed_up_dates() -> set:
-    if not BACKUP_SUCCESS_FILE.exists():
-        return set()
-    return set(BACKUP_SUCCESS_FILE.read_text().split())
-
-
-def prune_old_local_raw() -> None:
-    """Deletes local raw/<feed>/date=X folders once X is both older than
-    PRUNE_LOCAL_RAW_AFTER_DAYS and confirmed present in the HF backup.
-    Parquet is never touched here -- it's small and worth keeping locally too."""
-    if PRUNE_LOCAL_RAW_AFTER_DAYS <= 0:
-        return
-    cutoff = datetime.now(timezone.utc) - timedelta(days=PRUNE_LOCAL_RAW_AFTER_DAYS)
-    done = backed_up_dates()
-    for feed_name in FEEDS:
-        feed_raw_dir = RAW_DIR / feed_name
-        if not feed_raw_dir.exists():
-            continue
-        for date_dir in feed_raw_dir.glob("date=*"):
-            date_str = date_dir.name.replace("date=", "")
+    def process_result(self, result: FetchResult, cycle_errors: list[str]) -> None:
+        date_str = datetime.fromtimestamp(result.response_received_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        if result.payload is None:
+            self.logger.warning("Fetch failed for %s: %s", result.feed_name, result.error)
+            self.monitor.record_failure(
+                result.feed_name,
+                now_ts=result.response_received_ts,
+                error=result.error or "unknown fetch failure",
+                http_status=result.http_status,
+            )
+            event = self._failure_event(result)
             try:
-                d = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            except ValueError:
+                append_poll_event(self.config.data_dir, result.feed_name, date_str, event)
+            except Exception:
+                cycle_errors.append(f"{result.feed_name}:poll_journal_failed")
+                self.logger.exception("CRITICAL: failed to append poll failure journal for %s", result.feed_name)
+            return
+
+        payload_hash = hashlib.sha256(result.payload).hexdigest()
+        content_hash = payload_hash
+        raw_archived, raw_ok, raw_error = self._archive_raw(result, date_str)
+        feed = None
+        parsed_rows: list[dict[str, Any]] = []
+        emitted_rows: list[dict[str, Any]] = []
+        parse_ok = False
+        spool_ok = True
+        spool_path: str | None = None
+        parse_error: str | None = None
+        try:
+            feed = parse_feed(result.payload)
+            content_digest = hashlib.sha256()
+            for serialized_entity in sorted(entity.SerializeToString() for entity in feed.entity):
+                content_digest.update(len(serialized_entity).to_bytes(8, "big"))
+                content_digest.update(serialized_entity)
+            content_hash = content_digest.hexdigest()
+            context = {
+                "poll_id": result.poll_id,
+                "request_started_at": result.request_started_at,
+                "response_received_at": result.response_received_at,
+            }
+            parsed_rows = PARSERS[result.feed_name](feed, context)
+            tracker = self.trackers.get(result.feed_name)
+            emitted_rows = tracker.filter(parsed_rows, date_str, result.response_received_ts, update=False) if tracker else parsed_rows
+            staged = self.spool.stage(result.feed_name, date_str, result.poll_id, emitted_rows)
+            spool_path = str(staged.relative_to(self.config.data_dir)) if staged else None
+            if tracker:
+                tracker.commit(emitted_rows, date_str, result.response_received_ts)
+            parse_ok = True
+        except Exception as error:
+            parse_error = _redact_error(error, self.config.api_key)
+            # Distinguish parse failures from spool failures without risking a
+            # second parser pass. Either way, force a raw snapshot so this poll
+            # can be rebuilt even when TripUpdates was not otherwise due.
+            if feed is not None:
+                spool_ok = False
+            self.logger.exception("Failed parsing/staging %s; preserving a raw fallback", result.feed_name)
+            if not raw_archived:
+                fallback_written, fallback_ok, fallback_error = self._archive_raw(result, date_str, force=True)
+                raw_archived = fallback_written
+                raw_ok = fallback_ok
+                raw_error = fallback_error
+
+        header_timestamp = None
+        min_entity_timestamp = None
+        max_entity_timestamp = None
+        entity_count = None
+        if feed is not None:
+            header_timestamp = feed.header.timestamp if feed.header.HasField("timestamp") else None
+            min_entity_timestamp, max_entity_timestamp = entity_timestamp_range(result.feed_name, feed)
+            entity_count = len(feed.entity)
+        flags = self.monitor.record_success(
+            result.feed_name,
+            now_ts=result.response_received_ts,
+            header_timestamp=header_timestamp,
+            content_sha256=content_hash,
+            min_entity_timestamp=min_entity_timestamp,
+            max_entity_timestamp=max_entity_timestamp,
+            parse_ok=parse_ok,
+            raw_ok=raw_ok,
+            spool_ok=spool_ok,
+            entity_count=entity_count,
+            request_started_at=result.request_started_at,
+            response_received_at=result.response_received_at,
+            http_status=result.http_status,
+            latency_ms=result.latency_ms,
+            payload_size=len(result.payload),
+            payload_sha256=payload_hash,
+        )
+        event = {
+            "version": 1,
+            "poll_id": result.poll_id,
+            "feed": result.feed_name,
+            "poll_interval_seconds": self.config.poll_interval_seconds,
+            "request_started_at": result.request_started_at,
+            "response_received_at": result.response_received_at,
+            "http_status": result.http_status,
+            "latency_ms": round(result.latency_ms, 3),
+            "success": True,
+            "error": parse_error,
+            "payload_size": len(result.payload),
+            "payload_sha256": payload_hash,
+            "entity_content_sha256": content_hash,
+            "feed_header_timestamp": header_timestamp,
+            "min_entity_timestamp": min_entity_timestamp,
+            "max_entity_timestamp": max_entity_timestamp,
+            "entity_count": entity_count,
+            "freshness_flags": flags,
+            "raw_due": raw_archived or not raw_ok,
+            "raw_archive_interval_seconds": self.config.raw_archive_intervals[result.feed_name],
+            "raw_archived": raw_archived,
+            "raw_ok": raw_ok,
+            "raw_path": str(self._raw_path(result.feed_name, date_str).relative_to(self.config.data_dir)) if raw_archived else None,
+            "raw_error": raw_error,
+            "parse_ok": parse_ok,
+            "parsed_rows": len(parsed_rows),
+            "emitted_rows": len(emitted_rows) if parse_ok else 0,
+            "spool_ok": spool_ok,
+            "spool_path": spool_path,
+        }
+        try:
+            append_poll_event(self.config.data_dir, result.feed_name, date_str, event)
+        except Exception:
+            cycle_errors.append(f"{result.feed_name}:poll_journal_failed")
+            self.logger.exception("CRITICAL: failed to append poll journal for %s", result.feed_name)
+
+    def poll_once(self) -> dict[str, Any]:
+        poll_id = uuid.uuid4().hex
+        cycle_errors: list[str] = []
+        futures: dict[Future[FetchResult], str] = {
+            self.executor.submit(self.fetch_feed, feed_name, poll_id): feed_name for feed_name in FEED_NAMES
+        }
+        for future in as_completed(futures):
+            feed_name = futures[future]
+            try:
+                result = future.result()
+            except Exception as error:
+                # Defensive: fetch_feed normally converts all request failures.
+                cycle_errors.append(f"{feed_name}:unexpected_fetch_worker_failure")
+                self.logger.error("Unexpected fetch worker failure for %s: %s", feed_name, _redact_error(error, self.config.api_key))
                 continue
-            if d < cutoff and date_str in done:
-                shutil.rmtree(date_dir, ignore_errors=True)
-                logger.info("Pruned local raw for %s/date=%s (confirmed on Hugging Face already)", feed_name, date_str)
+            try:
+                self.process_result(result, cycle_errors)
+            except Exception as error:
+                cycle_errors.append(f"{feed_name}:unexpected_processing_failure")
+                self.logger.exception("Unexpected result-processing failure for %s: %s", feed_name, type(error).__name__)
 
+        flush = self.spool.flush()
+        for error in flush.errors:
+            self.logger.error("Parquet flush failed; durable spool retained for retry: %s", error)
+        if flush.files_written:
+            self.logger.info("Committed %d rows to %d Parquet file(s)", flush.rows_written, len(flush.files_written))
+        try:
+            _total, _used, free = shutil.disk_usage(self.config.data_dir)
+        except FileNotFoundError:
+            self.config.data_dir.mkdir(parents=True, exist_ok=True)
+            _total, _used, free = shutil.disk_usage(self.config.data_dir)
+        try:
+            status = self.monitor.write_status(
+                now_ts=time.time(),
+                poll_id=poll_id,
+                disk_free_bytes=free,
+                disk_warn_bytes=int(self.config.disk_warn_free_gb * 1_000_000_000),
+                disk_critical_bytes=int(self.config.disk_critical_free_gb * 1_000_000_000),
+                pending_spool_segments=len(self.spool.pending_segments()),
+                parquet_flush_errors=flush.errors,
+                cycle_errors=cycle_errors,
+            )
+        except Exception:
+            self.logger.exception("CRITICAL: failed to persist collector health status")
+            status = {"healthy": False, "reasons": ["health_status_write_failed"]}
+        if not status["healthy"]:
+            self.logger.error("Collector health is degraded: %s", ", ".join(status["reasons"]))
+        return status
 
-def download_static_gtfs() -> None:
-    now = datetime.now(timezone.utc)
-    STATIC_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = STATIC_DIR / f"budapest_gtfs_{now:%Y-%m-%d}.zip"
-    try:
-        resp = session.get(STATIC_GTFS_URL, timeout=60)
-        resp.raise_for_status()
-        out_path.write_bytes(resp.content)
-        logger.info("Downloaded static GTFS -> %s (%.1f MB)", out_path, len(resp.content) / 1e6)
-    except Exception:
-        logger.exception("Failed to download static GTFS this month -- will retry next cycle check")
+    def run(self) -> None:
+        self.config.data_dir.mkdir(parents=True, exist_ok=True)
+        self.recover_current_raw_tails()
+        recovered = self.spool.flush(force=True)
+        if recovered.errors:
+            self.logger.error("Startup spool recovery is pending: %s", "; ".join(recovered.errors))
+        elif recovered.files_written:
+            self.logger.info("Recovered %d staged rows from an earlier process", recovered.rows_written)
+        self.logger.info(
+            "Starting realtime-only collector. data=%s interval=%.1fs trip_raw=%.1fs",
+            self.config.data_dir,
+            self.config.poll_interval_seconds,
+            self.config.raw_archive_intervals["tripupdates"],
+        )
+        next_deadline = time.monotonic()
+        while not _shutdown_requested:
+            self.poll_once()
+            next_deadline += self.config.poll_interval_seconds
+            now = time.monotonic()
+            while next_deadline <= now:
+                next_deadline += self.config.poll_interval_seconds
+            while not _shutdown_requested:
+                remaining = next_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(1.0, remaining))
 
+        self.logger.info("Shutdown requested; committing all durable spool segments.")
+        result = self.spool.flush(force=True)
+        if result.errors:
+            self.logger.error("Parquet remains pending in durable spool: %s", "; ".join(result.errors))
+        self.executor.shutdown(wait=True, cancel_futures=False)
+        for session in self.sessions.values():
+            session.close()
+        self.logger.info("Clean shutdown complete; no in-memory-only derived rows remain.")
 
-# --------------------------------------------------------------------------
-# Main loop
-# --------------------------------------------------------------------------
 
 def main() -> None:
-    logger.info("Starting BKK collector. Data dir: %s. Poll interval: %ss.", DATA_DIR, POLL_INTERVAL_SECONDS)
-    if not HF_TOKEN or not HF_REPO_ID:
-        logger.warning("HF_TOKEN/HF_REPO_ID not both set -- running WITHOUT cloud backup. "
-                        "Data only exists on this machine's disk until you configure it.")
-
-    state = load_state()
-    disk_check_counter = 0
-
-    while not _shutdown_requested:
-        cycle_start = time.monotonic()
-
-        poll_once()
-        flush_parquet()
-
-        disk_check_counter += 1
-        if disk_check_counter % 20 == 0:  # roughly every ~10 min at 30s interval
-            check_disk_space()
-
-        maybe_backup_and_refresh(state)
-
-        elapsed = time.monotonic() - cycle_start
-        sleep_for = max(0.0, POLL_INTERVAL_SECONDS - elapsed)
-        # Sleep in small slices so a shutdown signal is picked up quickly.
-        slept = 0.0
-        while slept < sleep_for and not _shutdown_requested:
-            time.sleep(min(1.0, sleep_for - slept))
-            slept += 1.0
-
-    logger.info("Shutting down -- flushing remaining buffered rows.")
-    flush_parquet(force=True)
-    logger.info("Clean shutdown complete.")
+    config = CollectorConfig.from_env()
+    collector = Collector(config)
+    collector.run()
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
     main()

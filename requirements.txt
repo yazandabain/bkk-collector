@@ -1,5 +1,4 @@
-requests==2.32.3
-gtfs-realtime-bindings==1.0.0
-pandas==2.2.3
-pyarrow==17.0.0
-huggingface_hub==0.25.2
+requests==2.34.2
+gtfs-realtime-bindings==2.1.0
+pyarrow==25.0.0
+huggingface_hub==1.27.0

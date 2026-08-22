@@ -71,19 +71,30 @@ class ChangeTracker:
                 continue
             if prev is None or new is None:
                 return True
-            if abs(new - prev) >= self.tolerance:
+            if self.tolerance <= 0:
+                if new != prev:
+                    return True
+            elif abs(new - prev) >= self.tolerance:
                 return True
         return False
 
-    def filter(self, rows: list, date_str: str, now_ts: float) -> list:
+    def filter(self, rows: list, date_str: str, now_ts: float, *, update: bool = True) -> list:
+        """Select changed rows.
+
+        ``update=False`` supports a durable two-phase flow: select rows, write
+        them to the on-disk spool, then call :meth:`commit`.  A failed spool
+        write therefore cannot advance dedup state and silently suppress the
+        retry on the next poll.
+        """
         self._maybe_reset(date_str)
         out = []
+        prospective = dict(self._last)
         for row in rows:
             key = tuple(row.get(f) for f in self.key_fields)
             exact_vals = tuple(row.get(f) for f in self.value_fields)
             numeric_vals = tuple(row.get(f) for f in self.numeric_tolerance_fields)
 
-            prev = self._last.get(key)
+            prev = prospective.get(key)
             if prev is None:
                 write = True
             else:
@@ -96,5 +107,15 @@ class ChangeTracker:
 
             if write:
                 out.append(row)
-                self._last[key] = (exact_vals, numeric_vals, now_ts)
+                prospective[key] = (exact_vals, numeric_vals, now_ts)
+        if update:
+            self._last = prospective
         return out
+
+    def commit(self, rows: list, date_str: str, now_ts: float) -> None:
+        self._maybe_reset(date_str)
+        for row in rows:
+            key = tuple(row.get(f) for f in self.key_fields)
+            exact_vals = tuple(row.get(f) for f in self.value_fields)
+            numeric_vals = tuple(row.get(f) for f in self.numeric_tolerance_fields)
+            self._last[key] = (exact_vals, numeric_vals, now_ts)
