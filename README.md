@@ -1,226 +1,400 @@
-# BKK realtime collector
+# BKK realtime research collector
 
-Polls BKK's `VehiclePositions`, `TripUpdates` and `Alerts` GTFS-realtime feeds every
-30 seconds, forever, and writes two copies of everything:
+This service continuously collects BKK GTFS-Realtime VehiclePositions,
+TripUpdates, and Alerts, plus content-addressed versions of BKK's static GTFS.
+It is designed for a small Ubuntu VPS and prioritizes recoverability and clear
+data-quality evidence over infrastructure complexity.
 
-1. **`data/raw/<feed>/date=YYYY-MM-DD/<feed>.rawlog`** — the exact bytes BKK sent
-   back, gzip-compressed, appended in order. This is the irreplaceable part.
-2. **`data/parquet/<feed>/date=YYYY-MM-DD/part-*.parquet`** — the same data, parsed
-   into flat tables, for actually working with in pandas/Polars/DuckDB later.
+Data source attribution: **BKK Zrt., CC BY 4.0**.
 
-If the parsing code ever turns out to have a bug, `rebuild_parquet.py` regenerates
-(2) from (1) — nothing is lost, you just get a cleaner version later. This is the
-`make rebuild` target the study plan calls for.
+## What is collected, at what resolution
 
-Once a day it also uploads the previous day's data to a private Hugging Face
-dataset repo, so the data doesn't only exist on one disk. Once a month it
-re-downloads the static schedule zip (with a dated filename, since old versions
-can't be recovered either).
+The default realtime poll interval is 30 seconds. Every feed request has its
+own UTC `request_started_at` and `response_received_at`; a shared random
+`poll_id` groups the three requests from one cycle.
 
----
+| Feed | Raw protobuf default | Derived Parquet default |
+| --- | --- | --- |
+| VehiclePositions | every successful poll (~30 s) | every observation |
+| TripUpdates | every 300 s | evaluated every poll; changed rows plus 30-minute heartbeat |
+| Alerts | every successful poll (~30 s) | changed rows plus 30-minute heartbeat |
 
-## 0. Storage, honestly
+The raw archive is authoritative **at the timestamps it contains**. In
+particular, a default five-minute TripUpdates raw archive cannot reconstruct
+the 30-second derived change stream. The derived stream is therefore staged to
+disk before dedup state advances and survives a collector crash, but it is not
+equivalent to full 30-second raw protobuf history.
 
-Measured feed sizes for the live Budapest network: VehiclePositions ~189KB,
-Alerts ~185KB, **TripUpdates ~4.9MB**. That last one is what matters: BKK
-retransmits full remaining-stop predictions for every active trip on *every*
-poll, so archiving it raw every 30 seconds would mean ~14GB/day, uncompressed
-— several terabytes over 9 months. Not workable on a cheap VPS or free
-storage.
+`DELAY_CHANGE_THRESHOLD_SECONDS=15` only controls whether a TripUpdates row is
+emitted. Stored delays are never rounded. The identity is:
 
-So the collector doesn't do that. It still *polls* TripUpdates every 30s
-(cheap — one HTTP request), but:
-
-- **Only writes a row when something actually changed** for that specific
-  (trip, stop) — a delay prediction that's identical to last poll doesn't get
-  re-stored, only re-confirmed every 30 minutes as a heartbeat (`HEARTBEAT_SECONDS`).
-
-  "Changed" for delays means **moved by ≥ `DELAY_CHANGE_THRESHOLD_SECONDS`
-  (default 15s) from the value last written for that stop** — not "differs by
-  any amount." BKK recalculates ETAs continuously off live GPS, so a delay
-  wobbles by a second or two on nearly every poll even when nothing has
-  actually happened; exact-equality comparison treats that noise as signal.
-  Comparison is against the last *written* value rather than a fixed grid, so
-  a value can hover anywhere without triggering writes, while slow cumulative
-  drift still gets recorded each time it accumulates past the threshold. The
-  raw, un-rounded delay is what's stored in every row that does get written —
-  the threshold only decides *when* to write, never what.
-
-  ⚠️ Two earlier versions of this got it wrong, both caught by testing:
-  (1) `HEARTBEAT_SECONDS` was set to 300s, the same as the flush interval, so
-  nearly everything got force-rewritten every flush; (2) a floor-division
-  bucketing approach flapped across bucket boundaries — a delay oscillating
-  43↔47 crossed the 45 boundary and wrote on ~7 of 10 polls. The current
-  tolerance-against-last-written approach has neither failure mode.
-
-### Validating the threshold against your own data
-
-`check_threshold.py` measures the real distribution of delay changes from your
-archived raw logs and reports what each candidate threshold would suppress:
-
-```bash
-docker compose exec collector python3 check_threshold.py
-docker compose exec collector python3 check_threshold.py /data/raw/tripupdates/date=2026-08-19/tripupdates.rawlog
+```text
+entity_id + trip_id + start_date + start_time + stop_sequence + stop_id
 ```
 
-Read the "fraction SUPPRESSED at each candidate threshold" table. If 15s is
-suppressing well over ~90% you could probably go lower and keep more detail;
-if it's suppressing very little, most changes are genuinely large and the
-volume you're seeing is real rather than noise. Adjust
-`DELAY_CHANGE_THRESHOLD_SECONDS` in `.env` and `make up` to apply.
-  Same logic applies to Alerts. VehiclePositions is left alone — a vehicle's
-  position is basically always different from last poll, so dedup wouldn't
-  help, and the feed is small anyway.
-- **Archives the raw TripUpdates bytes every 5 minutes instead of every 30
-  seconds** (`TRIPUPDATES_RAW_ARCHIVE_SECONDS`) — still a solid ground-truth
-  trail for `rebuild_parquet.py`, just not a wasteful one.
-- **Prunes old local raw files automatically**, but *only* once they're
-  confirmed uploaded to Hugging Face and older than 14 days
-  (`PRUNE_LOCAL_RAW_AFTER_DAYS`). The VPS disk only ever needs to hold a
-  rolling couple of weeks — Hugging Face holds the real history. It will
-  never delete anything it hasn't confirmed is backed up somewhere else.
+This distinguishes repeated visits by one trip to the same stop. Changes to
+categorical schedule/vehicle fields also emit a row. Delay and predicted-time
+fields use the configured tolerance against the last durably staged value.
+If an upstream stop update omits `stop_sequence`, its list ordinal is retained
+as an explicit fallback identity rather than collapsing repeated stop IDs.
 
-With this, expect roughly **1–2 GB/day** of new raw data (mostly TripUpdates)
-plus a much smaller Parquet layer (dedup means most polls add few or no new
-rows). Over 9 months that's a genuinely non-trivial dataset — plausibly
-**100–200GB** — which is exactly what you want for the flagship project, but
-it does mean: **start on Hugging Face's free tier, and when you're a few
-weeks in, check your usage at huggingface.co/settings** (free private storage
-is 100GB). If you're approaching that, you have two easy outs: **HF PRO is
-$9/month for 1TB** (the same $9/month your plan already earmarks for ZeroGPU
-quota — same product, dual benefit), or you can simply flip the dataset repo
-to public earlier than planned (BKK's data is CC BY 4.0, so nothing stops
-you) — a rougher, less-documented public repo now is a fine trade for not
-worrying about storage, and you polish it into the flagship writeup later.
-I'd revisit this at the reassessment checkpoint in November rather than
-solving it today.
+To validate a threshold at 30-second cadence, temporarily set:
 
-**Before you deploy anything, confirm the numbers above still hold and that
-the key actually works** — I can't reach `bkk.hu` from where I am to test
-this live, so you're the first one to actually hit these endpoints:
-
-```bash
-curl -s -o vp.pb "https://go.bkk.hu/api/query/v1/ws/gtfs-rt/full/VehiclePositions.pb?key=YOUR_KEY"
-curl -s -o tu.pb "https://go.bkk.hu/api/query/v1/ws/gtfs-rt/full/TripUpdates.pb?key=YOUR_KEY"
-curl -s -o al.pb "https://go.bkk.hu/api/query/v1/ws/gtfs-rt/full/Alerts.pb?key=YOUR_KEY"
-ls -la vp.pb tu.pb al.pb
-pip install gtfs-realtime-bindings --break-system-packages
-python3 -c "
-from google.transit import gtfs_realtime_pb2 as pb
-f = pb.FeedMessage(); f.ParseFromString(open('tu.pb','rb').read())
-print(len(f.entity), 'entities')
-"
+```dotenv
+TRIPUPDATES_ANALYSIS_SAMPLE_SECONDS=30
 ```
 
-If TripUpdates is dramatically bigger than 5MB or the entity count looks
-off, tell me before you deploy — the throttle intervals above are tuned to
-what you already measured, not a guess.
-
-## 1. Where to run it
-
-You want this on a machine that's on 24/7 with its own internet connection —
-**not your laptop**. Two options, both fine:
-
-- **A small paid VPS (recommended): Hetzner Cloud CX22/CX23, ~€5–6/month.**
-  Simple signup, no capacity or account-approval roulette, EU-based (good
-  latency to Budapest, and GDPR-friendly). Given this data cannot be
-  recreated, I'd rather you spend €5/month than lose weeks to a free-tier
-  account getting flagged or a region running out of capacity — both are
-  real, documented problems with the free option below in 2026.
-- **Oracle Cloud "Always Free" tier — genuinely €0/month forever.** An ARM VM
-  (currently 2 OCPU / 12 GB RAM after a June 2026 reduction, still plenty for
-  this) with 200 GB disk. The catch: signup sometimes gets flagged for manual
-  review, and some regions report "out of capacity" for the free shape. If
-  you have patience to retry and want to spend nothing, this works fine —
-  just don't let signup friction eat into the runway before term starts.
-
-Either way, once you have a Ubuntu VM with a public IP and SSH access, every
-step below is identical. Pick whichever and let me know if you get stuck on
-that provider's specific signup flow.
-
-## 2. Set up the VM
+Then analyze the resulting raw log:
 
 ```bash
-ssh root@YOUR_VM_IP
-apt update && apt install -y docker.io docker-compose-plugin git
-systemctl enable --now docker
+docker compose exec collector python check_threshold.py \
+  /data/raw/tripupdates/date=YYYY-MM-DD/tripupdates.rawlog \
+  --expected-interval 30 --require-high-frequency
 ```
 
-## 3. Get the code onto the VM and configure it
+With the production 300-second raw interval, the script prints a warning and
+does not claim that five-minute transitions validate a 30-second threshold.
 
-From your own machine, copy this whole folder to the VM (simplest way — `scp`):
+## Process architecture
 
-```bash
-scp -r bkk_collector root@YOUR_VM_IP:/root/
+`collector` is the realtime-only process. The three requests run concurrently
+with bounded connect/read retries. As each response finishes, it is archived
+before parsing when that feed's raw interval is due. A parse or spool failure
+forces a raw snapshot for that poll. Derived rows are written to small atomic,
+gzip-compressed spool segments; bounded-size commits prevent a long failed-write
+backlog from being loaded into RAM at once. A successful, validated atomic
+Parquet commit is the only event that removes those segments.
+
+`maintenance` is a separate process/container. It performs:
+
+- daily static GTFS checks and hash versioning;
+- completed-day Parquet compaction;
+- daily manifest generation and validation;
+- Hugging Face uploads and remote verification;
+- receipt-gated local raw pruning;
+- external healthcheck pings.
+
+A hung/crashed upload may delay backup, but cannot delay realtime polling.
+Docker restarts the two processes independently.
+
+## Crash and restart behavior
+
+- Raw records are one append plus `fsync` by default. On startup, an invalid
+  tail in today's log is detached to `*.corrupt-tail-*` for forensic recovery;
+  the proven-valid prefix then safely accepts new records. An atomic last-good
+  byte checkpoint makes later restarts inspect only a possible trailing append;
+  legacy logs are scanned once to establish that checkpoint.
+- Spool files are atomically renamed into place. If Parquet writing fails,
+  every segment remains pending and is retried. On startup, pending segments
+  are flushed before the next poll.
+- A crash after the Parquet rename but before spool cleanup is idempotent: the
+  deterministic output is row-count validated, then the old segments are
+  removed. This can create a recoverable duplicate only if external/manual
+  changes defeat that transaction; loss is preferred against duplicates.
+- SIGTERM/SIGINT stops new polls, forces a spool flush, and exits. If Parquet
+  remains unavailable, the durable spool remains on disk.
+- Every derived file and state JSON uses a same-directory temporary file plus
+  `fsync` and atomic rename.
+- Compaction writes and validates its output before deleting source parts. A
+  transaction marker completes cleanup after a crash.
+
+## Data layout
+
+```text
+data/
+  raw/<feed>/date=YYYY-MM-DD/<feed>.rawlog
+  raw/<feed>/date=YYYY-MM-DD/<feed>.rawlog.checkpoint.json
+  parquet/<feed>/date=YYYY-MM-DD/part-*.parquet
+  spool/<feed>/date=YYYY-MM-DD/batch-*.json.gz
+  metadata/polls/<feed>/date=YYYY-MM-DD/polls.jsonl
+  metadata/manifests/date=YYYY-MM-DD.json
+  static_gtfs/
+    versions/<sha256>.zip
+    history.jsonl
+    state.json
+    budapest_gtfs_YYYY-MM-DD.zip       # preserved legacy files, if any
+  health/status.json
+  health/freshness_state.json
+  maintenance/status.json
+  backup_receipts/date=YYYY-MM-DD.json
+  backup_history.jsonl
+  backup_status.json
+  prune_history.jsonl
+  logs/collector.log
+  logs/maintenance.log
+  parquet_rebuild_previous/...        # rollback copies created by rebuilds
 ```
 
-Then on the VM:
+Raw log framing remains backward compatible:
+
+```text
+8-byte big-endian float64 response timestamp
+4-byte big-endian uint32 compressed length
+gzip-compressed protobuf bytes
+```
+
+Poll journals contain HTTP status, request/response timestamps, latency,
+payload size/SHA-256, feed header timestamp, min/max entity timestamps where
+available, raw/parse/spool outcomes, row counts, and freshness incidents.
+
+Parquet schema version 2 keeps scalar research fields plus canonical JSON for
+repeated/nested structures. It includes current standard GTFS-RT metadata,
+vehicle/trip/stop-event/alert fields and BKK's published realCity fields:
+vehicle model/type, deviated/door state, stop distance, scheduled stop events,
+and BKK alert text/route details. The original protobuf remains the fallback
+for unknown future extensions. New schema versions may add nullable columns;
+when querying mixed historical files, use schema unioning (for example DuckDB
+`read_parquet(..., union_by_name=true)`).
+
+## Daily manifests and backup semantics
+
+For every completed UTC day, maintenance builds a manifest with:
+
+- expected/attempted/successful/failed polls per feed;
+- first and last successes;
+- raw snapshot counts and raw-log integrity;
+- parsed/emitted/Parquet row counts;
+- stale-feed incidents and pending spool segments;
+- applicable static GTFS hash/version;
+- size and SHA-256 for every required artifact;
+- collector schema/version/optional git commit;
+- separate `complete` and `quality_ok` results.
+
+`complete` means required local artifacts are internally consistent and can be
+backed up. `quality_ok` is stricter evidence about polling gaps/staleness. A
+real HTTP-200 empty feed has a raw protobuf, poll evidence, and a typed empty
+Parquet artifact. Missing collection does not masquerade as an empty feed.
+
+Backup backlog is derived as:
+
+```text
+completed local dates - dates with verified v2 receipts
+```
+
+The worker retries older failures automatically and skips permanently
+incomplete legacy dates without starving newer complete dates. It uploads each
+manifest-listed file idempotently, then checks every remote path and size.
+For Hugging Face LFS objects it also compares the remote LFS SHA-256. A local
+receipt is written only after all checks pass. Non-LFS remote verification is
+path+size (the manifest still stores the local SHA-256), so do not interpret it
+as an independent download-and-rehash proof.
+The receipt is itself uploaded and remotely verified before its local final
+name is installed.
+
+`backup_success_dates.txt` from collector v1 is preserved but deliberately not
+trusted, because v1 could record a partial date. Only files under
+`backup_receipts/` authorize new pruning. Old dates without v2 poll journals
+remain visibly incomplete and are never newly pruned automatically.
+
+When `PRUNE_LOCAL_RAW_AFTER_DAYS` is positive, raw date directories older than
+that age are removed only if a receipt exists and every still-local raw file
+still matches the receipt. Parquet, manifests, static GTFS, and receipts are not
+auto-pruned. Set the value to `0` for no automatic raw pruning.
+
+Hugging Face is one off-server copy, not a complete 3-2-1 backup strategy. For
+irreplaceable research, periodically replicate the dataset repo to a second
+provider or offline disk.
+
+## Static GTFS version history
+
+Maintenance downloads and validates the current ZIP at least daily. It checks
+ZIP integrity and required tables, computes SHA-256, and stores a new
+`versions/<sha256>.zip` only when the content is new. `history.jsonl` records
+every successful observation time, content hash, size, path, and `feed_version`
+when present. Existing `budapest_gtfs_YYYY-MM-DD.zip` files are indexed in place
+without moving or deleting them.
+
+The applicable version in a daily manifest is the newest version observed by
+the end of that UTC day. Because checks are daily, the exact BKK publication
+instant is only bounded between two observations; the project does not claim
+finer historical applicability.
+Every distinct static archive known locally, including preserved legacy
+archives, is manifest-listed for off-server backup. Previously verified LFS
+objects are checksum-matched and skipped on retries/daily reuse.
+
+## Health and staleness
+
+HTTP 200 alone is not healthy. The collector persists and evaluates:
+
+- feed header timestamp age;
+- unchanged header timestamp duration;
+- unchanged entity-content hash duration (excluding the changing feed header);
+- time since last successful response;
+- parse/raw/spool/Parquet failures;
+- free disk space.
+
+Alerts use a one-day default unchanged-payload warning, and empty Alerts
+content does not trigger it while its header advances, because legitimately
+unchanged alerts are common. That warning is evidence in feed status/manifests,
+not a liveness failure by itself. Tune thresholds if BKK's header semantics
+produce false positives; do not disable absence/disk checks casually.
+
+Docker marks `collector` unhealthy when `health/status.json` is stale or
+degraded. `maintenance` independently checks daily static freshness and a stale
+v2 backup backlog. `HEALTHCHECK_URL`, when configured, is called only by the
+maintenance process and only while both status files are healthy.
+
+Verify health:
 
 ```bash
-cd /root/bkk_collector
+docker compose ps
+docker compose exec -T collector python healthcheck.py
+docker compose exec -T maintenance python maintenance_healthcheck.py
+docker compose logs --since=30m collector maintenance
+du -sh data/raw data/parquet data/spool data/static_gtfs
+df -h .
+```
+
+Useful evidence:
+
+```bash
+jq . data/health/status.json
+jq . data/maintenance/status.json
+jq . data/metadata/manifests/date=YYYY-MM-DD.json
+jq . data/backup_receipts/date=YYYY-MM-DD.json
+```
+
+Any spool segments older than the configured five-minute flush, repeated
+`CRITICAL`, `Parquet flush failed`, stale-source reasons, low disk, or a growing
+backup backlog requires investigation.
+
+## Configuration
+
+Copy `.env.example` to `.env`. Existing environment names are retained. New
+variables all have safe defaults; the most important are:
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `BKK_API_KEY` | required | BKK realtime key |
+| `DATA_DIR` | `/data` | mounted persistent data root |
+| `POLL_INTERVAL_SECONDS` | `30` | realtime cycle cadence |
+| `PARQUET_FLUSH_MINUTES` | `5` | maximum normal spool residence |
+| `TRIPUPDATES_RAW_ARCHIVE_SECONDS` | `300` | TripUpdates raw cadence |
+| `TRIPUPDATES_ANALYSIS_SAMPLE_SECONDS` | `0` | optional temporary faster raw cadence |
+| `DELAY_CHANGE_THRESHOLD_SECONDS` | `15` | TripUpdates event tolerance |
+| `HEARTBEAT_SECONDS` | `1800` | forced dedup heartbeat |
+| `HF_TOKEN`, `HF_REPO_ID` | empty | enable private dataset backup |
+| `BACKUP_HOUR_UTC` | `3` | earliest daily backup hour |
+| `BACKUP_RETRY_SECONDS` | `900` | pending backlog retry interval |
+| `PRUNE_LOCAL_RAW_AFTER_DAYS` | `14` | receipt-gated raw retention; `0` disables |
+| `STATIC_GTFS_CHECK_INTERVAL_SECONDS` | `86400` | successful static check interval |
+| `FEED_STALE_SECONDS` | `180` | source timestamp age limit |
+| `FEED_ABSENT_SECONDS` | `180` | no-success limit |
+| `FROZEN_PAYLOAD_SECONDS` | `300` | VP/TU unchanged limit |
+| `ALERTS_FROZEN_PAYLOAD_SECONDS` | `86400` | Alerts unchanged warning limit |
+| `DISK_WARN_FREE_GB` | `2.0` | unhealthy warning threshold |
+| `DISK_CRITICAL_FREE_GB` | `0.5` | critical disk threshold |
+| `PARQUET_COMPACTION_ENABLED` | `true` | completed-day background compaction |
+| `HEALTHCHECK_URL` | empty | optional external dead-man ping |
+
+See `.env.example` for HTTP bounds and the remaining maintenance settings.
+
+## Initial deployment
+
+On Ubuntu with Docker Engine and Compose v2:
+
+```bash
+git clone YOUR_REPOSITORY_URL bkk_collector
+cd bkk_collector
 cp .env.example .env
-nano .env   # paste your real BKK_API_KEY; optionally HF_TOKEN + HF_REPO_ID
+nano .env
+docker compose build
+docker compose up -d
+docker compose ps
+docker compose logs -f --tail=100 collector maintenance
 ```
 
-For the Hugging Face backup (optional but recommended — you already have an
-HF account per the plan's Phase 0 checklist):
-1. huggingface.co → Settings → Access Tokens → create one with **write** role.
-2. Pick a repo id like `yourname/bkk-transit-raw` — the script creates it
-   automatically as a **private** dataset repo on first backup. You keep it
-   private until Block 3, when the flagship project publishes a cleaned,
-   public version.
+Do not put tokens in Compose YAML or commit `.env`. `.dockerignore` excludes the
+data directory and secrets from Docker build context—important once raw data is
+large.
 
-## 4. Start it
+## Safe upgrade from collector v1
+
+Building does not stop the old container, so build first. Do not overwrite the
+server's existing `.env`; merge new defaults into it. For the first 24–48 hours,
+setting `PRUNE_LOCAL_RAW_AFTER_DAYS=0` is a conservative way to inspect v2
+receipts before re-enabling pruning.
 
 ```bash
-make up
-make logs      # watch it for a minute, Ctrl+C to stop watching (container keeps running)
+cd /path/to/bkk_collector
+git status --short
+git pull --ff-only
+docker compose build
+docker compose up -d --no-deps collector
+docker compose up -d maintenance
+docker compose ps
+docker compose logs --since=10m collector maintenance
 ```
 
-You should see lines like `Flushed N rows -> .../part-HHMMSS.parquet` every few
-minutes. If you instead see repeated `Fetch failed for ...` warnings, the key or
-URL is wrong — recheck `.env`.
+Compose sends SIGTERM to v1 and honors the grace period, allowing its RAM
+buffer to flush before replacement. The collector interruption is normally a
+few seconds. Existing `raw/`, `parquet/`, dated static ZIPs, state, and backup
+files are not renamed or deleted by migration. V2 begins writing additional
+directories beside them.
 
-`restart: unless-stopped` in docker-compose.yml means it survives VM reboots and
-crashes automatically — you don't need to babysit it.
-
-## 5. Weekly, ~10 minutes (matches the plan's maintenance budget)
+After one completed UTC day:
 
 ```bash
-make status    # container still running? how much disk is data/ using? how much disk is free overall?
-make logs      # skim for repeated errors
+docker compose exec -T collector python healthcheck.py
+docker compose exec -T maintenance python maintenance_healthcheck.py
+ls -l data/metadata/manifests data/backup_receipts
+find data/spool -name 'batch-*.json.gz' -mmin +10 -print
 ```
 
-Also glance at your HF dataset repo (if configured) to confirm yesterday's
-folders are actually landing there — that's your real backup, not just a
-nice-to-have.
+## Rebuilding derived Parquet
 
-## 6. If disk fills up
+Rebuilds stream rows in bounded chunks and never delete the installed
+partition before a complete replacement exists. The old partition is moved to
+`data/parquet_rebuild_previous/` for rollback.
 
-The collector logs a loud `LOW DISK SPACE` warning well before it would crash,
-but the safe fix is: once you've confirmed (via the HF repo) that a date's data
-is backed up, you can delete the local `data/raw/*/date=OLD-DATE` folders for
-that date — the Parquet stays useful on its own, and the raw copy already lives
-on Hugging Face. Never delete a local raw folder you haven't confirmed is backed
-up somewhere else.
+```bash
+# Prevent maintenance from compacting/backing up a partition mid-rebuild.
+# Realtime collection can continue when only completed dates are rebuilt.
+docker compose stop maintenance
 
-## 7. About the No-AI-debt rule
+# One completed day/feed (recommended first)
+docker compose run --rm collector python rebuild_parquet.py \
+  --date YYYY-MM-DD --feed tripupdates
 
-I wrote this. That's a reasonable call for a piece of infrastructure where the
-cost of *not* getting it running this week is unrecoverable, unlike CS50P or
-Karpathy where the resource *is* the point. But the spirit of your own rule 1
-is worth honoring here too, on your own timeline rather than under this
-week's time pressure: once it's safely running, put an hour into actually
-reading `gtfs_rt_parse.py` and `collector.py` — during Missing Semester /
-Docker in Block 1 is a natural moment, since that's where you'd learn this
-stuff properly anyway. It's ~250 lines total and none of it is exotic. You'll
-want that understanding anyway: "I built and operated a data pipeline" is a
-bullet point in your plan, and an interviewer asking "walk me through how it
-works" deserves a real answer, not a recited one.
+# All completed raw dates/feeds
+docker compose run --rm collector python rebuild_parquet.py
+docker compose start maintenance
+```
 
-## 8. License
+By default, a corrupt raw tail or any parse failure leaves the current Parquet
+untouched. `--allow-parse-errors` is an explicit acceptance of partial derived
+output and should only be used after inspecting the raw issue. Rebuilding the
+current UTC date is refused unless explicitly overridden; stop the collector
+before using that override.
 
-Per BKK's terms, anything you publish derived from this data must credit:
-**"Data source: BKK Zrt., CC BY 4.0"**. Keep this in mind for Project 4's
-dataset card and README — it belongs in both the HF dataset card and any
-published repo.
+Rebuild limitations:
+
+- it reconstructs only raw snapshot timestamps;
+- default TripUpdates history is five-minute, not the live 30-second event
+  stream;
+- v1 raw framing contains only response timestamp and bytes, so exact v2
+  request-start time/poll grouping is synthesized during rebuild;
+- an upstream interval in which no successful response was archived cannot be
+  recovered later.
+
+Each replaced partition remains under `data/parquet_rebuild_previous/`. To
+roll back, stop maintenance, move the installed derived partition aside, move
+the chosen previous directory back to
+`data/parquet/<feed>/date=YYYY-MM-DD`, and restart maintenance. Raw archives
+are never changed by a rebuild.
+
+## Tests
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m compileall -q .
+```
+
+The suite covers same-stop TripUpdates identity, write-failure retention,
+restart recovery, UTC midnight partitioning, stale/frozen detection, missing
+protobuf optionals, multi-period/multilingual/BKK alerts, raw-tail recovery,
+static hash behavior, real PyArrow schemas, compaction row preservation, empty
+versus missing daily artifacts, backup retry/remote verification, and a full
+synthetic three-feed collection cycle.
