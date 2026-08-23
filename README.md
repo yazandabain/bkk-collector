@@ -29,7 +29,7 @@ after every collector start is always raw-archived for every feed.
 
 `DELAY_CHANGE_THRESHOLD_SECONDS=15` controls delay-field emission, while
 `TRIPUPDATE_TIME_TOLERANCE_SECONDS` independently controls absolute
-arrival/departure prediction revisions (5 seconds by default). Stored
+arrival/departure prediction revisions (2 seconds by default). Stored
 values are never rounded. The identity is:
 
 ```text
@@ -403,7 +403,7 @@ variables all have safe defaults; the most important are:
 | `TRIPUPDATES_RAW_ARCHIVE_SECONDS` | `300` | TripUpdates raw cadence |
 | `TRIPUPDATES_ANALYSIS_SAMPLE_SECONDS` | `0` | optional temporary faster raw cadence |
 | `DELAY_CHANGE_THRESHOLD_SECONDS` | `15` | TripUpdates event tolerance |
-| `TRIPUPDATE_TIME_TOLERANCE_SECONDS` | `5` | absolute arrival/departure prediction tolerance; the older `PREDICTION_TIME_CHANGE_THRESHOLD_SECONDS` name remains a deprecated fallback |
+| `TRIPUPDATE_TIME_TOLERANCE_SECONDS` | `2` | provisional absolute arrival/departure prediction tolerance; the older `PREDICTION_TIME_CHANGE_THRESHOLD_SECONDS` name remains a deprecated fallback |
 | `BKK_STOP_DISTANCE_CHANGE_THRESHOLD` | inherits `15` | BKK stop-distance tolerance |
 | `CHANGE_TRACKER_NULL_GUARD_ROWS` | `1000` | all-null prediction signal fail-loud threshold |
 | `HEARTBEAT_SECONDS` | `1800` | forced dedup heartbeat |
@@ -459,7 +459,7 @@ VEHICLE_POSITIONS_INTERVAL_SECONDS=10
 TRIP_UPDATES_INTERVAL_SECONDS=10
 ALERTS_INTERVAL_SECONDS=30
 TRIPUPDATES_RAW_ARCHIVE_SECONDS=300
-TRIPUPDATE_TIME_TOLERANCE_SECONDS=5
+TRIPUPDATE_TIME_TOLERANCE_SECONDS=2
 CHANGE_TRACKER_NULL_GUARD_ROWS=1000
 PRUNE_LOCAL_RAW_AFTER_DAYS=0
 ```
