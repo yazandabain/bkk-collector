@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 
 FEED_NAMES = ("vehiclepositions", "tripupdates", "alerts")
+DEFAULT_FEED_INTERVALS = {
+    "vehiclepositions": 10.0,
+    "tripupdates": 10.0,
+    "alerts": 30.0,
+}
+MIN_REALTIME_INTERVAL_SECONDS = 5.0
 STATIC_GTFS_URL = "https://go.bkk.hu/api/static/v1/public-gtfs/budapest_gtfs.zip"
 
 
@@ -31,11 +38,20 @@ def feed_urls(api_key: str) -> dict[str, str]:
 class CollectorConfig:
     api_key: str
     data_dir: Path
-    poll_interval_seconds: float = 30.0
+    # POLL_INTERVAL_SECONDS is retained only as a migration fallback.  A
+    # feed-specific value always wins; when neither is set the production
+    # defaults in DEFAULT_FEED_INTERVALS apply.
+    poll_interval_seconds: float | None = None
+    vehicle_positions_interval_seconds: float | None = None
+    trip_updates_interval_seconds: float | None = None
+    alerts_interval_seconds: float | None = None
     parquet_flush_seconds: float = 300.0
     tripupdates_raw_archive_seconds: float = 300.0
     tripupdates_analysis_sample_seconds: float = 0.0
     delay_change_threshold_seconds: int = 15
+    prediction_time_change_threshold_seconds: int = 5
+    bkk_stop_distance_change_threshold: int | None = None
+    change_tracker_null_guard_rows: int = 1000
     heartbeat_seconds: int = 1800
     disk_warn_free_gb: float = 2.0
     disk_critical_free_gb: float = 0.5
@@ -50,9 +66,24 @@ class CollectorConfig:
     raw_fsync: bool = True
 
     def __post_init__(self) -> None:
+        if self.poll_interval_seconds is not None and (
+            not math.isfinite(self.poll_interval_seconds)
+            or self.poll_interval_seconds < MIN_REALTIME_INTERVAL_SECONDS
+        ):
+            raise ValueError(
+                f"POLL_INTERVAL_SECONDS must be at least {MIN_REALTIME_INTERVAL_SECONDS:g} seconds"
+            )
+        for feed_name, interval in self.feed_intervals.items():
+            if not math.isfinite(interval) or interval < MIN_REALTIME_INTERVAL_SECONDS:
+                env_name = {
+                    "vehiclepositions": "VEHICLE_POSITIONS_INTERVAL_SECONDS",
+                    "tripupdates": "TRIP_UPDATES_INTERVAL_SECONDS",
+                    "alerts": "ALERTS_INTERVAL_SECONDS",
+                }[feed_name]
+                raise ValueError(f"{env_name} must be at least {MIN_REALTIME_INTERVAL_SECONDS:g} seconds")
         positive = {
-            "poll_interval_seconds": self.poll_interval_seconds,
             "heartbeat_seconds": self.heartbeat_seconds,
+            "change_tracker_null_guard_rows": self.change_tracker_null_guard_rows,
             "connect_timeout_seconds": self.connect_timeout_seconds,
             "read_timeout_seconds": self.read_timeout_seconds,
             "feed_stale_seconds": self.feed_stale_seconds,
@@ -61,20 +92,26 @@ class CollectorConfig:
             "alerts_frozen_payload_seconds": self.alerts_frozen_payload_seconds,
         }
         for name, value in positive.items():
-            if value <= 0:
+            if not math.isfinite(float(value)) or value <= 0:
                 raise ValueError(f"{name} must be greater than zero")
         nonnegative = {
             "parquet_flush_seconds": self.parquet_flush_seconds,
             "tripupdates_raw_archive_seconds": self.tripupdates_raw_archive_seconds,
             "tripupdates_analysis_sample_seconds": self.tripupdates_analysis_sample_seconds,
             "delay_change_threshold_seconds": self.delay_change_threshold_seconds,
+            "prediction_time_change_threshold_seconds": self.prediction_time_change_threshold_seconds,
+            "bkk_stop_distance_change_threshold": (
+                self.bkk_stop_distance_change_threshold
+                if self.bkk_stop_distance_change_threshold is not None
+                else self.delay_change_threshold_seconds
+            ),
             "disk_warn_free_gb": self.disk_warn_free_gb,
             "disk_critical_free_gb": self.disk_critical_free_gb,
             "http_connect_retries": self.http_connect_retries,
             "http_backoff_seconds": self.http_backoff_seconds,
         }
         for name, value in nonnegative.items():
-            if value < 0:
+            if not math.isfinite(float(value)) or value < 0:
                 raise ValueError(f"{name} must not be negative")
         if self.disk_warn_free_gb < self.disk_critical_free_gb:
             raise ValueError("DISK_WARN_FREE_GB must be at least DISK_CRITICAL_FREE_GB")
@@ -88,11 +125,45 @@ class CollectorConfig:
         return cls(
             api_key=api_key,
             data_dir=Path(os.environ.get("DATA_DIR", "/data")),
-            poll_interval_seconds=float(os.environ.get("POLL_INTERVAL_SECONDS", "30")),
+            poll_interval_seconds=(
+                float(os.environ["POLL_INTERVAL_SECONDS"])
+                if "POLL_INTERVAL_SECONDS" in os.environ
+                else None
+            ),
+            vehicle_positions_interval_seconds=(
+                float(os.environ["VEHICLE_POSITIONS_INTERVAL_SECONDS"])
+                if "VEHICLE_POSITIONS_INTERVAL_SECONDS" in os.environ
+                else None
+            ),
+            trip_updates_interval_seconds=(
+                float(os.environ["TRIP_UPDATES_INTERVAL_SECONDS"])
+                if "TRIP_UPDATES_INTERVAL_SECONDS" in os.environ
+                else None
+            ),
+            alerts_interval_seconds=(
+                float(os.environ["ALERTS_INTERVAL_SECONDS"])
+                if "ALERTS_INTERVAL_SECONDS" in os.environ
+                else None
+            ),
             parquet_flush_seconds=float(os.environ.get("PARQUET_FLUSH_MINUTES", "5")) * 60,
             tripupdates_raw_archive_seconds=float(os.environ.get("TRIPUPDATES_RAW_ARCHIVE_SECONDS", "300")),
             tripupdates_analysis_sample_seconds=analysis_interval,
             delay_change_threshold_seconds=int(os.environ.get("DELAY_CHANGE_THRESHOLD_SECONDS", "15")),
+            # PREDICTION_TIME_CHANGE_THRESHOLD_SECONDS was the brief pre-release
+            # name. Keep it as a fallback so an already prepared deployment
+            # does not silently change tolerance.
+            prediction_time_change_threshold_seconds=int(
+                os.environ.get(
+                    "TRIPUPDATE_TIME_TOLERANCE_SECONDS",
+                    os.environ.get("PREDICTION_TIME_CHANGE_THRESHOLD_SECONDS", "5"),
+                )
+            ),
+            bkk_stop_distance_change_threshold=(
+                int(os.environ["BKK_STOP_DISTANCE_CHANGE_THRESHOLD"])
+                if "BKK_STOP_DISTANCE_CHANGE_THRESHOLD" in os.environ
+                else None
+            ),
+            change_tracker_null_guard_rows=int(os.environ.get("CHANGE_TRACKER_NULL_GUARD_ROWS", "1000")),
             heartbeat_seconds=int(os.environ.get("HEARTBEAT_SECONDS", "1800")),
             disk_warn_free_gb=float(os.environ.get("DISK_WARN_FREE_GB", "2.0")),
             disk_critical_free_gb=float(os.environ.get("DISK_CRITICAL_FREE_GB", "0.5")),
@@ -114,6 +185,38 @@ class CollectorConfig:
             trip_interval = min(trip_interval, self.tripupdates_analysis_sample_seconds)
         return {"vehiclepositions": 0.0, "tripupdates": trip_interval, "alerts": 0.0}
 
+    @property
+    def feed_intervals(self) -> dict[str, float]:
+        overrides = {
+            "vehiclepositions": self.vehicle_positions_interval_seconds,
+            "tripupdates": self.trip_updates_interval_seconds,
+            "alerts": self.alerts_interval_seconds,
+        }
+        return {
+            feed_name: float(
+                overrides[feed_name]
+                if overrides[feed_name] is not None
+                else self.poll_interval_seconds
+                if self.poll_interval_seconds is not None
+                else DEFAULT_FEED_INTERVALS[feed_name]
+            )
+            for feed_name in FEED_NAMES
+        }
+
+    @property
+    def trip_update_numeric_tolerances(self) -> dict[str, float]:
+        prediction = self.prediction_time_change_threshold_seconds
+        distance = (
+            self.bkk_stop_distance_change_threshold
+            if self.bkk_stop_distance_change_threshold is not None
+            else self.delay_change_threshold_seconds
+        )
+        return {
+            "arrival_time": float(prediction),
+            "departure_time": float(prediction),
+            "bkk_stop_distance": float(distance),
+        }
+
 
 @dataclass(frozen=True)
 class MaintenanceConfig:
@@ -132,7 +235,6 @@ class MaintenanceConfig:
     healthcheck_ping_interval_seconds: float = 300.0
     compact_parquet: bool = True
     compaction_min_files: int = 12
-    poll_interval_seconds: float = 30.0
     backup_stale_hours: float = 48.0
 
     def __post_init__(self) -> None:
@@ -145,11 +247,10 @@ class MaintenanceConfig:
             "static_retry_seconds": self.static_retry_seconds,
             "maintenance_interval_seconds": self.maintenance_interval_seconds,
             "healthcheck_ping_interval_seconds": self.healthcheck_ping_interval_seconds,
-            "poll_interval_seconds": self.poll_interval_seconds,
             "backup_stale_hours": self.backup_stale_hours,
         }
         for name, value in positive.items():
-            if value <= 0:
+            if not math.isfinite(float(value)) or value <= 0:
                 raise ValueError(f"{name} must be greater than zero")
         if self.backup_date_grace_minutes < 0:
             raise ValueError("BACKUP_DATE_GRACE_MINUTES must not be negative")
@@ -178,6 +279,5 @@ class MaintenanceConfig:
             healthcheck_ping_interval_seconds=float(os.environ.get("HEALTHCHECK_PING_INTERVAL_SECONDS", "300")),
             compact_parquet=env_bool("PARQUET_COMPACTION_ENABLED", True),
             compaction_min_files=int(os.environ.get("PARQUET_COMPACTION_MIN_FILES", "12")),
-            poll_interval_seconds=float(os.environ.get("POLL_INTERVAL_SECONDS", "30")),
             backup_stale_hours=float(os.environ.get("BACKUP_STALE_HOURS", "48")),
         )

@@ -17,7 +17,7 @@ from atomic_io import atomic_write_json, read_json
 from backup import BackupManager
 from config import MaintenanceConfig
 from collector import configure_logging
-from manifests import build_daily_manifest, discover_completed_dates
+from manifests import build_daily_manifest
 from monitoring import poll_journal_path, utc_iso
 from parquet_compact import compact_partition
 from static_gtfs import StaticGtfsStore
@@ -83,8 +83,11 @@ class MaintenanceWorker:
         if not self.config.compact_parquet:
             return
         self.compaction_errors = []
-        confirmed = self.backup.confirmed_dates()
-        candidates = [date for date in discover_completed_dates(self.config.data_dir) if date not in confirmed]
+        # Never compact legacy partitions: compaction deletes its source parts
+        # after an atomic replacement, while the legacy migration invariant is
+        # byte-for-byte preservation of original artifacts. Only dates with a
+        # full set of v2 poll journals enter this path.
+        candidates = self._v2_pending_dates()
         for date_str in candidates[: self.config.backup_max_dates_per_run]:
             for feed_name in ("vehiclepositions", "tripupdates", "alerts"):
                 try:
@@ -131,7 +134,7 @@ class MaintenanceWorker:
         if now_monotonic - self.last_manifest_run_monotonic < self.config.backup_retry_seconds:
             return
         self.last_manifest_run_monotonic = now_monotonic
-        dates = discover_completed_dates(self.config.data_dir)
+        dates = self.backup.pending_dates()
         for date_str in dates[-self.config.backup_max_dates_per_run :]:
             path = self.config.data_dir / "metadata" / "manifests" / f"date={date_str}.json"
             existing = read_json(path, {})
@@ -146,12 +149,15 @@ class MaintenanceWorker:
     def _v2_pending_dates(self) -> list[str]:
         pending = []
         for date_str in self.backup.pending_dates():
-            if any(poll_journal_path(self.config.data_dir, feed, date_str).exists() for feed in ("vehiclepositions", "tripupdates", "alerts")):
+            if all(poll_journal_path(self.config.data_dir, feed, date_str).exists() for feed in ("vehiclepositions", "tripupdates", "alerts")):
                 pending.append(date_str)
         return pending
 
     def write_status(self) -> dict[str, Any]:
         reasons: list[str] = []
+        warnings: list[str] = []
+        if not self.backup.enabled:
+            warnings.append("offsite_backup_disabled")
         static_state = read_json(self.config.data_dir / "static_gtfs" / "state.json", {})
         static_success = float(static_state.get("last_success_timestamp", 0))
         if not static_success or time.time() - static_success > max(2 * self.config.static_check_interval_seconds, 172800):
@@ -161,6 +167,28 @@ class MaintenanceWorker:
             oldest = datetime.strptime(pending[0], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
             if time.time() - oldest > self.config.backup_stale_hours * 3600:
                 reasons.append("backup_backlog_stale")
+        legacy_inventory = read_json(self.config.data_dir / "metadata" / "legacy_inventory.json", {})
+        legacy_dates = legacy_inventory.get("dates", []) if isinstance(legacy_inventory, dict) else []
+        unconfirmed_legacy = [
+            item.get("date")
+            for item in legacy_dates
+            if isinstance(item, dict)
+            and item.get("legacy_handled") is True
+            and item.get("remote_copy_confirmed") is not True
+        ]
+        if unconfirmed_legacy:
+            warnings.append("legacy_remote_copy_unconfirmed")
+        incomplete_legacy_inventory = [
+            item.get("date")
+            for item in legacy_dates
+            if isinstance(item, dict) and item.get("inventory_complete") is not True
+        ]
+        if incomplete_legacy_inventory:
+            warnings.append("legacy_inventory_incomplete")
+        legacy_static = legacy_inventory.get("static_gtfs", {}) if isinstance(legacy_inventory, dict) else {}
+        legacy_static_unconfirmed = bool(legacy_static.get("files")) and legacy_static.get("remote_copy_confirmed") is not True
+        if legacy_static_unconfirmed:
+            warnings.append("legacy_static_gtfs_remote_copy_unconfirmed")
         reasons.extend(f"compaction:{error}" for error in self.compaction_errors)
         status = {
             "version": 1,
@@ -168,17 +196,25 @@ class MaintenanceWorker:
             "updated_timestamp": time.time(),
             "healthy": not reasons,
             "reasons": reasons,
+            "warnings": warnings,
             "backup_enabled": self.backup.enabled,
             "pending_backup_dates": pending,
             "confirmed_backup_dates": len(self.backup.confirmed_dates()),
             "last_backup_results": self.last_backup_results,
+            "legacy_dates_inventoried": len(legacy_dates),
+            "legacy_remote_copy_unconfirmed_dates": unconfirmed_legacy,
+            "legacy_inventory_incomplete_dates": incomplete_legacy_inventory,
+            "legacy_static_gtfs_remote_copy_unconfirmed": legacy_static_unconfirmed,
             "static_gtfs": static_state,
         }
         atomic_write_json(self.config.data_dir / "maintenance" / "status.json", status)
         return status
 
     def maybe_ping_healthcheck(self, maintenance_status: dict[str, Any]) -> None:
-        if not self.config.healthcheck_url:
+        # A dead-man ping must not advertise fully protected operation when
+        # off-site backup is disabled, even though local-only use remains a
+        # supported maintenance mode.
+        if not self.config.healthcheck_url or not self.backup.enabled:
             return
         now_monotonic = time.monotonic()
         if now_monotonic - self.last_health_ping_monotonic < self.config.healthcheck_ping_interval_seconds:

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from atomic_io import atomic_write_json, sha256_file
-from config import FEED_NAMES
+from config import DEFAULT_FEED_INTERVALS, FEED_NAMES, MIN_REALTIME_INTERVAL_SECONDS
 from monitoring import iter_jsonl, poll_journal_path, utc_iso
 from parquet_store import ensure_empty_parquet, parquet_row_count
 from raw_log import scan_raw_log
@@ -47,6 +47,7 @@ def _feed_stats(data_dir: Path, feed_name: str, date_str: str, *, create_empty: 
     parse_successes = [event for event in responses if event.get("parse_ok")]
     raw_events = [event for event in responses if event.get("raw_archived")]
     emitted_rows = sum(int(event.get("emitted_rows") or 0) for event in parse_successes)
+    selected_rows = sum(int(event.get("selected_rows", event.get("emitted_rows")) or 0) for event in parse_successes)
     parsed_rows = sum(int(event.get("parsed_rows") or 0) for event in parse_successes)
     if attempted == 0:
         errors.append(f"{feed_name}: no recorded poll attempts")
@@ -59,7 +60,23 @@ def _feed_stats(data_dir: Path, feed_name: str, date_str: str, *, create_empty: 
     if corrupt_journal_lines:
         errors.append(f"{feed_name}: {corrupt_journal_lines} corrupt poll journal line(s)")
 
-    expected_interval = next((float(event.get("poll_interval_seconds")) for event in events if event.get("poll_interval_seconds")), 30.0)
+    observed_intervals: list[float] = []
+    for event in events:
+        try:
+            interval = float(event.get("poll_interval_seconds"))
+        except (TypeError, ValueError):
+            continue
+        if interval >= MIN_REALTIME_INTERVAL_SECONDS:
+            observed_intervals.append(interval)
+    observed_intervals.sort()
+    # Journals are per-feed. Use that feed's observed median cadence (robust to
+    # a deployment changing cadence part-way through a day), never another
+    # feed's or a global cycle interval.
+    expected_interval = (
+        observed_intervals[len(observed_intervals) // 2]
+        if observed_intervals
+        else DEFAULT_FEED_INTERVALS[feed_name]
+    )
     expected_polls = max(1, round(86400 / expected_interval))
     if attempted < expected_polls * 0.9:
         quality_flags.append(f"{feed_name}: only {attempted}/{expected_polls} expected polls recorded")
@@ -126,6 +143,7 @@ def _feed_stats(data_dir: Path, feed_name: str, date_str: str, *, create_empty: 
 
     timestamps = [event.get("response_received_at") for event in responses if event.get("response_received_at")]
     stats = {
+        "configured_poll_interval_seconds": expected_interval,
         "expected_polls": expected_polls,
         "attempted_polls": attempted,
         "successful_http_polls": len(responses),
@@ -139,12 +157,16 @@ def _feed_stats(data_dir: Path, feed_name: str, date_str: str, *, create_empty: 
         "journal_raw_snapshots": len(raw_events),
         "raw_log_clean": raw_clean,
         "parsed_rows_seen": parsed_rows,
+        "event_rows_selected": selected_rows,
         "event_rows_emitted": emitted_rows,
         "parquet_rows": parquet_rows,
         "parquet_files": len(parquet_files),
         "stale_feed_polls": stale_incidents,
         "corrupt_journal_lines": corrupt_journal_lines,
         "pending_spool_segments": len(pending_spool),
+        "scheduler_missed_deadlines": sum(
+            int(event.get("missed_deadlines_before_request") or 0) for event in events
+        ),
     }
     return stats, errors, quality_flags
 
@@ -173,14 +195,23 @@ def build_daily_manifest(
         quality_flags.extend(feed_quality)
 
     applicable_static = static_store.applicable_version(date_str)
+    day_start = date.timestamp()
+    static_timeline = static_store.observed_timeline(day_start, day_start + 86400)
     if applicable_static is None:
         errors.append("static_gtfs: no version history applicable to this date")
     else:
-        static_path = data_dir / "static_gtfs" / applicable_static["version_path"]
+        static_path = static_store.archive_path(applicable_static)
         if not static_path.exists():
             errors.append(f"static_gtfs: applicable archive missing: {applicable_static['version_path']}")
         elif sha256_file(static_path) != applicable_static.get("sha256"):
             errors.append("static_gtfs: applicable archive checksum mismatch")
+    if not static_timeline:
+        quality_flags.append("static_gtfs: no collector-observed version covers this date")
+    else:
+        if static_timeline[0]["effective_from"] != utc_iso(day_start):
+            quality_flags.append("static_gtfs: observed version history does not cover the start of this date")
+        if any(item["applicability_confidence"] == "legacy_schedule_uncertain" for item in static_timeline):
+            quality_flags.append("static_gtfs: legacy schedule applicability is uncertain")
 
     artifacts: list[dict[str, Any]] = []
     for feed_name in FEED_NAMES:
@@ -203,7 +234,11 @@ def build_daily_manifest(
             version_path = event.get("version_path")
             if not digest or not version_path or digest in seen_static_hashes:
                 continue
-            static_path = data_dir / "static_gtfs" / version_path
+            try:
+                static_path = static_store.archive_path(event)
+            except ValueError as error:
+                errors.append(f"static_gtfs: {error}")
+                continue
             if static_path.exists():
                 artifact = _artifact(data_dir, static_path, "static_gtfs")
                 if artifact["sha256"] != digest:
@@ -231,6 +266,7 @@ def build_daily_manifest(
         "quality_flags": quality_flags,
         "feeds": feeds,
         "static_gtfs": applicable_static,
+        "static_gtfs_timeline": static_timeline,
         "artifacts": artifacts,
     }
     path = data_dir / "metadata" / "manifests" / f"date={date_str}.json"
