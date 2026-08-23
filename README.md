@@ -29,7 +29,7 @@ after every collector start is always raw-archived for every feed.
 
 `DELAY_CHANGE_THRESHOLD_SECONDS=15` controls delay-field emission, while
 `TRIPUPDATE_TIME_TOLERANCE_SECONDS` independently controls absolute
-arrival/departure prediction revisions (5 seconds by default). Stored
+arrival/departure prediction revisions (2 seconds by default). Stored
 values are never rounded. The identity is:
 
 ```text
@@ -93,11 +93,13 @@ Forty legacy five-minute snapshots supplied during this audit contained
 3,612,217 comparable arrival predictions: 87.4% were identical, 11.50% moved
 by more than 5 seconds, p90 was 13 seconds, p95 43 seconds, p99 100 seconds,
 and the maximum was 12,490 seconds. This supports tracking absolute times and
-preserving large revisions, but does **not** establish the optimal tolerance at
-the new 10-second polling cadence. Five seconds is a deliberately
-data-preserving provisional default. Re-run the diagnostic on temporary
-10-second raw observations after deployment and revisit it using measured
-emission/storage rates; outliers are reported and never clamped.
+preserving large revisions, but does not select a 10-second-cadence tolerance.
+A newer live experiment at consecutive 10-second cadence evaluated 1,083,326
+comparable predictions and supports a smaller 2-second provisional default.
+That experiment was collected during night-service conditions, so 2 seconds is
+not claimed to be empirically final across daytime traffic and all services.
+Keep the setting configurable and revisit it using representative daytime
+emission/storage measurements; outliers are reported and never clamped.
 
 ## Process architecture
 
@@ -408,7 +410,7 @@ variables all have safe defaults; the most important are:
 | `TRIPUPDATES_RAW_ARCHIVE_SECONDS` | `300` | TripUpdates raw cadence |
 | `TRIPUPDATES_ANALYSIS_SAMPLE_SECONDS` | `0` | optional temporary faster raw cadence |
 | `DELAY_CHANGE_THRESHOLD_SECONDS` | `15` | TripUpdates event tolerance |
-| `TRIPUPDATE_TIME_TOLERANCE_SECONDS` | `5` | absolute arrival/departure prediction tolerance; the older `PREDICTION_TIME_CHANGE_THRESHOLD_SECONDS` name remains a deprecated fallback |
+| `TRIPUPDATE_TIME_TOLERANCE_SECONDS` | `2` | provisional absolute arrival/departure prediction tolerance; the older `PREDICTION_TIME_CHANGE_THRESHOLD_SECONDS` name remains a deprecated fallback |
 | `BKK_STOP_DISTANCE_CHANGE_THRESHOLD` | inherits `15` | BKK stop-distance tolerance |
 | `CHANGE_TRACKER_NULL_GUARD_ROWS` | `1000` | all-null prediction signal fail-loud threshold |
 | `HEARTBEAT_SECONDS` | `1800` | forced dedup heartbeat |
@@ -464,7 +466,7 @@ VEHICLE_POSITIONS_INTERVAL_SECONDS=10
 TRIP_UPDATES_INTERVAL_SECONDS=10
 ALERTS_INTERVAL_SECONDS=30
 TRIPUPDATES_RAW_ARCHIVE_SECONDS=300
-TRIPUPDATE_TIME_TOLERANCE_SECONDS=5
+TRIPUPDATE_TIME_TOLERANCE_SECONDS=2
 CHANGE_TRACKER_NULL_GUARD_ROWS=1000
 PRUNE_LOCAL_RAW_AFTER_DAYS=0
 ```

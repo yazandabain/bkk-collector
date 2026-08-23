@@ -49,7 +49,7 @@ class CollectorConfig:
     tripupdates_raw_archive_seconds: float = 300.0
     tripupdates_analysis_sample_seconds: float = 0.0
     delay_change_threshold_seconds: int = 15
-    prediction_time_change_threshold_seconds: int = 5
+    prediction_time_change_threshold_seconds: int = 2
     bkk_stop_distance_change_threshold: int | None = None
     change_tracker_null_guard_rows: int = 1000
     heartbeat_seconds: int = 1800
@@ -155,7 +155,7 @@ class CollectorConfig:
             prediction_time_change_threshold_seconds=int(
                 os.environ.get(
                     "TRIPUPDATE_TIME_TOLERANCE_SECONDS",
-                    os.environ.get("PREDICTION_TIME_CHANGE_THRESHOLD_SECONDS", "5"),
+                    os.environ.get("PREDICTION_TIME_CHANGE_THRESHOLD_SECONDS", "2"),
                 )
             ),
             bkk_stop_distance_change_threshold=(

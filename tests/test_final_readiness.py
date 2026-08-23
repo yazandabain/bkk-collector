@@ -207,6 +207,15 @@ class FinalReadinessTests(unittest.TestCase):
     def test_default_and_legacy_interval_configuration(self):
         default = CollectorConfig(api_key="x", data_dir=Path("/tmp/not-used"))
         self.assertEqual(DEFAULT_FEED_INTERVALS, default.feed_intervals)
+        self.assertEqual(2, default.prediction_time_change_threshold_seconds)
+        self.assertEqual(2.0, default.trip_update_numeric_tolerances["arrival_time"])
+        self.assertEqual(2.0, default.trip_update_numeric_tolerances["departure_time"])
+        custom_tolerance = CollectorConfig(
+            api_key="x",
+            data_dir=Path("/tmp/not-used"),
+            prediction_time_change_threshold_seconds=7,
+        )
+        self.assertEqual(7.0, custom_tolerance.trip_update_numeric_tolerances["arrival_time"])
         legacy = CollectorConfig(api_key="x", data_dir=Path("/tmp/not-used"), poll_interval_seconds=20)
         self.assertEqual({feed: 20.0 for feed in FEED_NAMES}, legacy.feed_intervals)
         overridden = CollectorConfig(
@@ -359,7 +368,7 @@ class FinalReadinessTests(unittest.TestCase):
         config = CollectorConfig(
             api_key="x",
             data_dir=Path("/tmp/not-used"),
-            prediction_time_change_threshold_seconds=5,
+            prediction_time_change_threshold_seconds=2,
         )
         tracker = ChangeTracker(
             key_fields=TRIP_UPDATE_KEY_FIELDS,
@@ -393,14 +402,29 @@ class FinalReadinessTests(unittest.TestCase):
             return row
 
         first = metro_row(0, "00")
-        self.assertEqual([first], tracker.filter([first], "2026-08-23", 0))
-        for seconds, jitter in ((10, 2), (20, 4), (30, 5)):
-            self.assertEqual([], tracker.filter([metro_row(jitter, f"{seconds:02d}")], "2026-08-23", seconds))
-        revised = metro_row(6, "40")
-        self.assertEqual([revised], tracker.filter([revised], "2026-08-23", 40))
+        self.assertEqual([first], tracker.filter([first], "2026-08-23", 0, update=False))
+        tracker.commit([first], "2026-08-23", 0)
+        for seconds, jitter in ((10, 1), (20, 2)):
+            self.assertEqual(
+                [],
+                tracker.filter(
+                    [metro_row(jitter, f"{seconds:02d}")],
+                    "2026-08-23",
+                    seconds,
+                    update=False,
+                ),
+            )
+        revised = metro_row(3, "30")
+        self.assertEqual([revised], tracker.filter([revised], "2026-08-23", 30, update=False))
+        tracker.commit([revised], "2026-08-23", 30)
         # Identical predictions still receive the normal long-term heartbeat.
-        heartbeat = metro_row(6, "50")
-        self.assertEqual([heartbeat], tracker.filter([heartbeat], "2026-08-23", 1840))
+        self.assertEqual(
+            [], tracker.filter([metro_row(3, "40")], "2026-08-23", 1829, update=False)
+        )
+        heartbeat = metro_row(3, "50")
+        self.assertEqual(
+            [heartbeat], tracker.filter([heartbeat], "2026-08-23", 1830, update=False)
+        )
 
     def test_surface_mode_null_delays_use_the_same_absolute_prediction_policy(self):
         config = CollectorConfig(api_key="x", data_dir=Path("/tmp/not-used"))
@@ -413,23 +437,37 @@ class FinalReadinessTests(unittest.TestCase):
             heartbeat_seconds=1800,
         )
 
-        def bus_row(revision: int):
+        def bus_row(revision: int | None):
             feed = pb.FeedMessage()
             feed.header.gtfs_realtime_version = "2.0"
             update = feed.entity.add(id="bus").trip_update
             update.trip.trip_id = "bus-trip"
             update.trip.route_id = "5"
             stop = update.stop_time_update.add(stop_id="bus-stop", stop_sequence=8)
-            stop.arrival.time = 1_800_001_000 + revision
-            stop.departure.time = 1_800_001_030 + revision
+            if revision is not None:
+                stop.arrival.time = 1_800_001_000 + revision
+                stop.departure.time = 1_800_001_030 + revision
             return parse_trip_updates(feed, "2026-08-23T01:00:00+00:00")[0]
 
         first = bus_row(0)
         self.assertIsNone(first["arrival_delay"])
-        self.assertEqual([first], tracker.filter([first], "2026-08-23", 0))
-        self.assertEqual([], tracker.filter([bus_row(5)], "2026-08-23", 10))
-        changed = bus_row(6)
-        self.assertEqual([changed], tracker.filter([changed], "2026-08-23", 20))
+        self.assertEqual([first], tracker.filter([first], "2026-08-23", 0, update=False))
+        tracker.commit([first], "2026-08-23", 0)
+        self.assertEqual([], tracker.filter([bus_row(1)], "2026-08-23", 10, update=False))
+        self.assertEqual([], tracker.filter([bus_row(2)], "2026-08-23", 20, update=False))
+        changed = bus_row(3)
+        self.assertEqual([changed], tracker.filter([changed], "2026-08-23", 30, update=False))
+        tracker.commit([changed], "2026-08-23", 30)
+
+        became_null = bus_row(None)
+        self.assertEqual(
+            [became_null], tracker.filter([became_null], "2026-08-23", 40, update=False)
+        )
+        tracker.commit([became_null], "2026-08-23", 40)
+        became_numeric = bus_row(3)
+        self.assertEqual(
+            [became_numeric], tracker.filter([became_numeric], "2026-08-23", 50, update=False)
+        )
 
     def test_all_null_primary_signals_fail_loudly_even_when_other_fields_are_populated(self):
         signal_fields = ("arrival_delay", "departure_delay", "arrival_time", "departure_time")
