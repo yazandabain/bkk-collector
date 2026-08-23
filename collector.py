@@ -27,11 +27,19 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from config import CollectorConfig, FEED_NAMES, feed_urls
-from dedup import ChangeTracker
+from dedup import ChangeTracker, ChangeTrackerSignalError
 from gtfs_rt_parse import PARSERS, parse_feed
 from monitoring import HealthMonitor, append_poll_event, entity_timestamp_range, utc_iso
 from parquet_store import DurableParquetSpool
 from raw_log import append_record, repair_truncated_tail
+from realtime_scheduler import IndependentFeedScheduler, ScheduledResult
+from trip_update_policy import (
+    TRIP_UPDATE_DELAY_FIELDS,
+    TRIP_UPDATE_EXACT_MUTABLE_FIELDS,
+    TRIP_UPDATE_KEY_FIELDS,
+    TRIP_UPDATE_PREDICTION_TIME_FIELDS,
+    TRIP_UPDATE_TOLERANT_NUMERIC_FIELDS,
+)
 
 
 LOGGER = logging.getLogger("bkk_collector")
@@ -120,27 +128,26 @@ class Collector:
             frozen_seconds=config.frozen_payload_seconds,
             alerts_frozen_seconds=config.alerts_frozen_payload_seconds,
         )
-        self.last_raw_archive_monotonic = {feed_name: 0.0 for feed_name in FEED_NAMES}
+        # None means this process has never successfully archived the feed.
+        # A numeric zero is not a safe sentinel: immediately after host boot,
+        # monotonic time can be below TripUpdates' five-minute raw interval.
+        self.last_raw_archive_monotonic: dict[str, float | None] = {
+            feed_name: None for feed_name in FEED_NAMES
+        }
         self.raw_needs_repair: set[Path] = set()
         self.trackers = self._make_trackers()
+        self.scheduler: IndependentFeedScheduler | None = None
 
     def _make_trackers(self) -> dict[str, ChangeTracker]:
         return {
             "tripupdates": ChangeTracker(
-                key_fields=(
-                    "entity_id", "trip_id", "start_date", "start_time", "stop_sequence",
-                    "stop_visit_fallback_index", "stop_id",
-                ),
-                value_fields=(
-                    "route_id", "direction_id", "schedule_relationship", "vehicle_id",
-                    "stop_schedule_relationship", "departure_occupancy_status", "stop_time_properties_json",
-                    "arrival_uncertainty", "departure_uncertainty",
-                    "bkk_scheduled_arrival_time", "bkk_scheduled_departure_time",
-                ),
-                numeric_tolerance_fields=(
-                    "arrival_delay", "departure_delay", "trip_delay", "arrival_time", "departure_time",
-                ),
+                key_fields=TRIP_UPDATE_KEY_FIELDS,
+                value_fields=TRIP_UPDATE_EXACT_MUTABLE_FIELDS,
+                numeric_tolerance_fields=TRIP_UPDATE_TOLERANT_NUMERIC_FIELDS,
                 tolerance=self.config.delay_change_threshold_seconds,
+                numeric_tolerances=self.config.trip_update_numeric_tolerances,
+                required_signal_fields=TRIP_UPDATE_DELAY_FIELDS + TRIP_UPDATE_PREDICTION_TIME_FIELDS,
+                null_guard_min_rows=self.config.change_tracker_null_guard_rows,
                 heartbeat_seconds=self.config.heartbeat_seconds,
             ),
             "alerts": ChangeTracker(
@@ -159,18 +166,46 @@ class Collector:
             ),
         }
 
-    def recover_current_raw_tails(self) -> None:
+    def recover_recent_raw_tails(self) -> None:
+        """Validate today's and the latest prior raw log for every feed.
+
+        Limiting startup work to at most two existing logs per feed covers a
+        crash across UTC midnight without repeatedly scanning months of data.
+        Valid records stay in place; repair_truncated_tail moves only the
+        invalid suffix to a forensic sidecar.
+        """
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         for feed_name in FEED_NAMES:
-            path = self.config.data_dir / "raw" / feed_name / f"date={today}" / f"{feed_name}.rawlog"
-            try:
-                recovery = repair_truncated_tail(path)
-            except Exception:
-                self.raw_needs_repair.add(path)
-                self.logger.exception("CRITICAL: could not validate current raw log tail for %s", feed_name)
-            else:
-                if recovery:
-                    self.logger.error("Detached an invalid raw-log tail to %s before resuming appends", recovery)
+            feed_root = self.config.data_dir / "raw" / feed_name
+            candidates: set[Path] = set()
+            today_path = feed_root / f"date={today}" / f"{feed_name}.rawlog"
+            if today_path.exists():
+                candidates.add(today_path)
+            prior: list[tuple[str, Path]] = []
+            if feed_root.exists():
+                for directory in feed_root.glob("date=*"):
+                    date_str = directory.name.removeprefix("date=")
+                    try:
+                        datetime.strptime(date_str, "%Y-%m-%d")
+                    except ValueError:
+                        continue
+                    path = directory / f"{feed_name}.rawlog"
+                    if date_str < today and path.exists():
+                        prior.append((date_str, path))
+            if prior:
+                candidates.add(max(prior)[1])
+            for path in sorted(candidates):
+                try:
+                    recovery = repair_truncated_tail(path)
+                except Exception:
+                    self.raw_needs_repair.add(path)
+                    self.logger.exception("CRITICAL: could not validate raw log tail for %s: %s", feed_name, path)
+                else:
+                    if recovery:
+                        self.logger.error("Detached an invalid raw-log tail to %s before resuming appends", recovery)
+
+    # Compatibility for callers of the v2.0 method name.
+    recover_current_raw_tails = recover_recent_raw_tails
 
     def fetch_feed(self, feed_name: str, poll_id: str) -> FetchResult:
         started_ts = time.time()
@@ -214,7 +249,8 @@ class Collector:
         assert result.payload is not None
         interval = self.config.raw_archive_intervals[result.feed_name]
         now_monotonic = time.monotonic()
-        due = force or now_monotonic - self.last_raw_archive_monotonic[result.feed_name] >= interval
+        last_archived = self.last_raw_archive_monotonic[result.feed_name]
+        due = force or last_archived is None or now_monotonic - last_archived >= interval
         if not due:
             return False, True, None
         raw_path = self._raw_path(result.feed_name, date_str)
@@ -222,7 +258,22 @@ class Collector:
             for pending_path in list(self.raw_needs_repair):
                 if pending_path.parent.parent.name != result.feed_name:
                     continue
-                recovery = repair_truncated_tail(pending_path)
+                try:
+                    recovery = repair_truncated_tail(pending_path)
+                except Exception:
+                    if pending_path == raw_path:
+                        # Never append behind an unvalidated tail in the same
+                        # file; that could hide valid future records behind a
+                        # malformed length/header.
+                        raise
+                    # A damaged/permission-denied historical partition must
+                    # remain visible for repair, but must not prevent today's
+                    # independent raw log from accepting new observations.
+                    self.logger.exception(
+                        "CRITICAL: prior raw log still needs repair but current archival will continue: %s",
+                        pending_path,
+                    )
+                    continue
                 if recovery:
                     self.logger.error("Detached failed raw append tail to %s before retry", recovery)
                 self.raw_needs_repair.discard(pending_path)
@@ -234,12 +285,26 @@ class Collector:
             self.logger.exception("CRITICAL: raw archive write failed for %s", result.feed_name)
             return False, False, _redact_error(error, self.config.api_key)
 
-    def _failure_event(self, result: FetchResult) -> dict[str, Any]:
+    def _schedule_event_fields(self, schedule: ScheduledResult | None) -> dict[str, Any]:
+        if schedule is None:
+            return {
+                "scheduled_for_at": None,
+                "scheduler_lag_ms": None,
+                "missed_deadlines_before_request": 0,
+            }
+        return {
+            "scheduled_for_at": schedule.scheduled_for_at,
+            "scheduler_lag_ms": round(schedule.scheduler_lag_ms, 3),
+            "missed_deadlines_before_request": schedule.missed_deadlines_before_request,
+        }
+
+    def _failure_event(self, result: FetchResult, schedule: ScheduledResult | None = None) -> dict[str, Any]:
         return {
             "version": 1,
             "poll_id": result.poll_id,
             "feed": result.feed_name,
-            "poll_interval_seconds": self.config.poll_interval_seconds,
+            "poll_interval_seconds": self.config.feed_intervals[result.feed_name],
+            **self._schedule_event_fields(schedule),
             "request_started_at": result.request_started_at,
             "response_received_at": result.response_received_at,
             "http_status": result.http_status,
@@ -252,10 +317,16 @@ class Collector:
             "raw_archived": False,
             "parse_ok": False,
             "parsed_rows": 0,
+            "selected_rows": 0,
             "emitted_rows": 0,
         }
 
-    def process_result(self, result: FetchResult, cycle_errors: list[str]) -> None:
+    def process_result(
+        self,
+        result: FetchResult,
+        cycle_errors: list[str],
+        schedule: ScheduledResult | None = None,
+    ) -> None:
         date_str = datetime.fromtimestamp(result.response_received_ts, tz=timezone.utc).strftime("%Y-%m-%d")
         if result.payload is None:
             self.logger.warning("Fetch failed for %s: %s", result.feed_name, result.error)
@@ -265,7 +336,7 @@ class Collector:
                 error=result.error or "unknown fetch failure",
                 http_status=result.http_status,
             )
-            event = self._failure_event(result)
+            event = self._failure_event(result, schedule)
             try:
                 append_poll_event(self.config.data_dir, result.feed_name, date_str, event)
             except Exception:
@@ -280,9 +351,14 @@ class Collector:
         parsed_rows: list[dict[str, Any]] = []
         emitted_rows: list[dict[str, Any]] = []
         parse_ok = False
+        change_tracking_ok = True
         spool_ok = True
         spool_path: str | None = None
         parse_error: str | None = None
+        change_tracking_error: str | None = None
+        change_tracking_failure_flag: str | None = None
+        spool_error: str | None = None
+        tracker = None
         try:
             feed = parse_feed(result.payload)
             content_digest = hashlib.sha256()
@@ -296,21 +372,50 @@ class Collector:
                 "response_received_at": result.response_received_at,
             }
             parsed_rows = PARSERS[result.feed_name](feed, context)
-            tracker = self.trackers.get(result.feed_name)
-            emitted_rows = tracker.filter(parsed_rows, date_str, result.response_received_ts, update=False) if tracker else parsed_rows
-            staged = self.spool.stage(result.feed_name, date_str, result.poll_id, emitted_rows)
-            spool_path = str(staged.relative_to(self.config.data_dir)) if staged else None
-            if tracker:
-                tracker.commit(emitted_rows, date_str, result.response_received_ts)
             parse_ok = True
         except Exception as error:
             parse_error = _redact_error(error, self.config.api_key)
-            # Distinguish parse failures from spool failures without risking a
-            # second parser pass. Either way, force a raw snapshot so this poll
-            # can be rebuilt even when TripUpdates was not otherwise due.
-            if feed is not None:
+            self.logger.exception("Failed parsing %s; preserving a raw fallback", result.feed_name)
+
+        if parse_ok:
+            tracker = self.trackers.get(result.feed_name)
+            try:
+                emitted_rows = (
+                    tracker.filter(parsed_rows, date_str, result.response_received_ts, update=False)
+                    if tracker
+                    else parsed_rows
+                )
+            except Exception as error:
+                change_tracking_ok = False
+                change_tracking_error = _redact_error(error, self.config.api_key)
+                change_tracking_failure_flag = (
+                    "change_tracker_signal_missing"
+                    if isinstance(error, ChangeTrackerSignalError)
+                    else "change_tracker_failed"
+                )
+                self.logger.exception(
+                    "CRITICAL: change tracking failed for %s; forcing raw fallback",
+                    result.feed_name,
+                )
+
+        if parse_ok and change_tracking_ok:
+            try:
+                # The tracker advances only after the atomic spool segment is
+                # durable. A failed stage is therefore eligible again later.
+                # This block is separate from parsing so health evidence can
+                # distinguish corrupt protobuf from storage failure.
+                staged = self.spool.stage(result.feed_name, date_str, result.poll_id, emitted_rows)
+                spool_path = str(staged.relative_to(self.config.data_dir)) if staged else None
+                if tracker:
+                    tracker.commit(emitted_rows, date_str, result.response_received_ts)
+            except Exception as error:
                 spool_ok = False
-            self.logger.exception("Failed parsing/staging %s; preserving a raw fallback", result.feed_name)
+                spool_error = _redact_error(error, self.config.api_key)
+                self.logger.exception("Failed staging %s; preserving a raw fallback", result.feed_name)
+
+        if not parse_ok or not change_tracking_ok or not spool_ok:
+            # Force a full snapshot when TripUpdates was between its normal raw
+            # intervals, so any parser/spool loss remains reconstructible.
             if not raw_archived:
                 fallback_written, fallback_ok, fallback_error = self._archive_raw(result, date_str, force=True)
                 raw_archived = fallback_written
@@ -333,6 +438,8 @@ class Collector:
             min_entity_timestamp=min_entity_timestamp,
             max_entity_timestamp=max_entity_timestamp,
             parse_ok=parse_ok,
+            change_tracking_ok=change_tracking_ok,
+            change_tracking_failure_flag=change_tracking_failure_flag,
             raw_ok=raw_ok,
             spool_ok=spool_ok,
             entity_count=entity_count,
@@ -347,13 +454,19 @@ class Collector:
             "version": 1,
             "poll_id": result.poll_id,
             "feed": result.feed_name,
-            "poll_interval_seconds": self.config.poll_interval_seconds,
+            "poll_interval_seconds": self.config.feed_intervals[result.feed_name],
+            **self._schedule_event_fields(schedule),
             "request_started_at": result.request_started_at,
             "response_received_at": result.response_received_at,
             "http_status": result.http_status,
             "latency_ms": round(result.latency_ms, 3),
             "success": True,
-            "error": parse_error,
+            "error": parse_error or change_tracking_error or spool_error,
+            "parse_error": parse_error,
+            "change_tracking_ok": change_tracking_ok,
+            "change_tracking_error": change_tracking_error,
+            "change_tracking_failure_flag": change_tracking_failure_flag,
+            "spool_error": spool_error,
             "payload_size": len(result.payload),
             "payload_sha256": payload_hash,
             "entity_content_sha256": content_hash,
@@ -370,7 +483,11 @@ class Collector:
             "raw_error": raw_error,
             "parse_ok": parse_ok,
             "parsed_rows": len(parsed_rows),
-            "emitted_rows": len(emitted_rows) if parse_ok else 0,
+            # selected_rows describes the change decision. emitted_rows is
+            # intentionally narrower: only rows already durable in an atomic
+            # spool segment count toward the Parquet completeness invariant.
+            "selected_rows": len(emitted_rows) if parse_ok and change_tracking_ok else 0,
+            "emitted_rows": len(emitted_rows) if parse_ok and change_tracking_ok and spool_ok else 0,
             "spool_ok": spool_ok,
             "spool_path": spool_path,
         }
@@ -380,27 +497,13 @@ class Collector:
             cycle_errors.append(f"{result.feed_name}:poll_journal_failed")
             self.logger.exception("CRITICAL: failed to append poll journal for %s", result.feed_name)
 
-    def poll_once(self) -> dict[str, Any]:
-        poll_id = uuid.uuid4().hex
-        cycle_errors: list[str] = []
-        futures: dict[Future[FetchResult], str] = {
-            self.executor.submit(self.fetch_feed, feed_name, poll_id): feed_name for feed_name in FEED_NAMES
-        }
-        for future in as_completed(futures):
-            feed_name = futures[future]
-            try:
-                result = future.result()
-            except Exception as error:
-                # Defensive: fetch_feed normally converts all request failures.
-                cycle_errors.append(f"{feed_name}:unexpected_fetch_worker_failure")
-                self.logger.error("Unexpected fetch worker failure for %s: %s", feed_name, _redact_error(error, self.config.api_key))
-                continue
-            try:
-                self.process_result(result, cycle_errors)
-            except Exception as error:
-                cycle_errors.append(f"{feed_name}:unexpected_processing_failure")
-                self.logger.exception("Unexpected result-processing failure for %s: %s", feed_name, type(error).__name__)
-
+    def _commit_and_write_status(
+        self,
+        poll_id: str,
+        cycle_errors: list[str],
+        scheduler_snapshot: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Retry durable commits and atomically publish current collector health."""
         flush = self.spool.flush()
         for error in flush.errors:
             self.logger.error("Parquet flush failed; durable spool retained for retry: %s", error)
@@ -421,6 +524,7 @@ class Collector:
                 pending_spool_segments=len(self.spool.pending_segments()),
                 parquet_flush_errors=flush.errors,
                 cycle_errors=cycle_errors,
+                scheduler=scheduler_snapshot,
             )
         except Exception:
             self.logger.exception("CRITICAL: failed to persist collector health status")
@@ -429,38 +533,101 @@ class Collector:
             self.logger.error("Collector health is degraded: %s", ", ".join(status["reasons"]))
         return status
 
+    def poll_once(self) -> dict[str, Any]:
+        """Synchronous one-shot helper retained for diagnostics/tests only."""
+        poll_id = uuid.uuid4().hex
+        cycle_errors: list[str] = []
+        futures: dict[Future[FetchResult], str] = {
+            self.executor.submit(self.fetch_feed, feed_name, poll_id): feed_name for feed_name in FEED_NAMES
+        }
+        for future in as_completed(futures):
+            feed_name = futures[future]
+            try:
+                result = future.result()
+            except Exception as error:
+                # Defensive: fetch_feed normally converts all request failures.
+                cycle_errors.append(f"{feed_name}:unexpected_fetch_worker_failure")
+                self.logger.error("Unexpected fetch worker failure for %s: %s", feed_name, _redact_error(error, self.config.api_key))
+                continue
+            try:
+                self.process_result(result, cycle_errors)
+            except Exception as error:
+                cycle_errors.append(f"{feed_name}:unexpected_processing_failure")
+                self.logger.exception("Unexpected result-processing failure for %s: %s", feed_name, type(error).__name__)
+
+        return self._commit_and_write_status(poll_id, cycle_errors)
+
     def run(self) -> None:
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
-        self.recover_current_raw_tails()
+        self.recover_recent_raw_tails()
         recovered = self.spool.flush(force=True)
         if recovered.errors:
             self.logger.error("Startup spool recovery is pending: %s", "; ".join(recovered.errors))
         elif recovered.files_written:
             self.logger.info("Recovered %d staged rows from an earlier process", recovered.rows_written)
         self.logger.info(
-            "Starting realtime-only collector. data=%s interval=%.1fs trip_raw=%.1fs",
+            "Starting realtime-only collector. data=%s intervals=%s trip_raw=%.1fs",
             self.config.data_dir,
-            self.config.poll_interval_seconds,
+            self.config.feed_intervals,
             self.config.raw_archive_intervals["tripupdates"],
         )
-        next_deadline = time.monotonic()
+        self.scheduler = IndependentFeedScheduler(
+            self.fetch_feed,
+            self.config.feed_intervals,
+            executor=self.executor,
+        )
+        self.scheduler.start()
+        cycle_errors: list[str] = []
+        last_status_monotonic = float("-inf")
         while not _shutdown_requested:
-            self.poll_once()
-            next_deadline += self.config.poll_interval_seconds
-            now = time.monotonic()
-            while next_deadline <= now:
-                next_deadline += self.config.poll_interval_seconds
-            while not _shutdown_requested:
-                remaining = next_deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                time.sleep(min(1.0, remaining))
+            item = self.scheduler.get(timeout=1.0)
+            if item is not None:
+                try:
+                    if item.worker_error is not None:
+                        cycle_errors.append(f"{item.feed_name}:unexpected_fetch_worker_failure")
+                        self.logger.error(
+                            "Unexpected fetch worker failure for %s: %s",
+                            item.feed_name,
+                            _redact_error(item.worker_error, self.config.api_key),
+                        )
+                    else:
+                        self.process_result(item.value, cycle_errors, item)
+                except Exception as error:
+                    cycle_errors.append(f"{item.feed_name}:unexpected_processing_failure")
+                    self.logger.exception(
+                        "Unexpected result-processing failure for %s: %s",
+                        item.feed_name,
+                        type(error).__name__,
+                    )
+                finally:
+                    self.scheduler.acknowledge(item)
 
-        self.logger.info("Shutdown requested; committing all durable spool segments.")
+            now_monotonic = time.monotonic()
+            if item is not None or now_monotonic - last_status_monotonic >= 5.0:
+                poll_id = item.poll_id if item is not None else uuid.uuid4().hex
+                self._commit_and_write_status(poll_id, cycle_errors, self.scheduler.snapshot(now_monotonic))
+                cycle_errors = []
+                last_status_monotonic = now_monotonic
+
+        self.logger.info("Shutdown requested; stopping new requests and draining active requests.")
+        for item in self.scheduler.stop_and_drain():
+            if item.worker_error is not None:
+                cycle_errors.append(f"{item.feed_name}:unexpected_fetch_worker_failure")
+                self.logger.error(
+                    "Unexpected fetch worker failure during shutdown for %s: %s",
+                    item.feed_name,
+                    _redact_error(item.worker_error, self.config.api_key),
+                )
+                continue
+            try:
+                self.process_result(item.value, cycle_errors, item)
+            except Exception:
+                cycle_errors.append(f"{item.feed_name}:unexpected_processing_failure")
+                self.logger.exception("Unexpected result-processing failure during shutdown for %s", item.feed_name)
+        self.logger.info("Committing all durable spool segments.")
         result = self.spool.flush(force=True)
         if result.errors:
             self.logger.error("Parquet remains pending in durable spool: %s", "; ".join(result.errors))
-        self.executor.shutdown(wait=True, cancel_futures=False)
         for session in self.sessions.values():
             session.close()
         self.logger.info("Clean shutdown complete; no in-memory-only derived rows remain.")

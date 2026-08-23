@@ -41,19 +41,36 @@ def validate_gtfs_zip(path: Path) -> dict[str, Any]:
 
 
 class StaticGtfsStore:
-    def __init__(self, data_dir: Path, *, check_interval_seconds: float, retry_seconds: float):
+    def __init__(
+        self,
+        data_dir: Path,
+        *,
+        check_interval_seconds: float,
+        retry_seconds: float,
+        create_root: bool = True,
+    ):
         self.root = data_dir / "static_gtfs"
         self.versions = self.root / "versions"
         self.history_path = self.root / "history.jsonl"
         self.state_path = self.root / "state.json"
         self.check_interval_seconds = check_interval_seconds
         self.retry_seconds = retry_seconds
-        self.root.mkdir(parents=True, exist_ok=True)
+        if create_root:
+            self.root.mkdir(parents=True, exist_ok=True)
 
     def history(self) -> list[dict[str, Any]]:
         if not self.history_path.exists():
             return []
         return [value for _line, value in iter_jsonl(self.history_path) if value]
+
+    def archive_path(self, event: dict[str, Any]) -> Path:
+        value = event.get("version_path")
+        if not isinstance(value, str) or not value:
+            raise ValueError("static GTFS history event lacks version_path")
+        relative = Path(value)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"unsafe static GTFS version path: {value}")
+        return self.root / relative
 
     def migrate_legacy_archives(self) -> int:
         """Index old dated ZIPs without renaming, copying, or deleting them."""
@@ -140,7 +157,7 @@ class StaticGtfsStore:
             previous_hash = state.get("latest_sha256")
             changed = digest != previous_hash
             matching_history = next((event for event in reversed(self.history()) if event.get("sha256") == digest), None)
-            destination = self.root / matching_history["version_path"] if matching_history else self.versions / f"{digest}.zip"
+            destination = self.archive_path(matching_history) if matching_history else self.versions / f"{digest}.zip"
             if not destination.exists():
                 os.replace(temporary, destination)
                 fsync_directory(destination.parent)
@@ -180,6 +197,12 @@ class StaticGtfsStore:
                 pass
 
     def applicable_version(self, date_str: str) -> dict[str, Any] | None:
+        """Compatibility helper returning the last version observed by day-end.
+
+        Consumers which join timestamped realtime observations must use
+        ``observed_version_at`` instead.  A UTC date can span more than one
+        static version.
+        """
         end = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() + 86400
         candidates = []
         for event in self.history():
@@ -190,3 +213,82 @@ class StaticGtfsStore:
             if checked < end:
                 candidates.append((checked, event))
         return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+    @staticmethod
+    def _checked_timestamp(event: dict[str, Any]) -> float | None:
+        try:
+            return datetime.fromisoformat(str(event["checked_at"]).replace("Z", "+00:00")).timestamp()
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _applicability_confidence(event: dict[str, Any]) -> str:
+        # Dated ZIPs from the old collector prove that the bytes existed
+        # locally, not the instant at which BKK published or retired them.
+        if event.get("source") == "legacy_archive_migration":
+            return "legacy_schedule_uncertain"
+        return "collector_observed"
+
+    def observed_version_at(self, timestamp: float) -> dict[str, Any] | None:
+        """Return the latest version the collector had observed at timestamp.
+
+        This never substitutes the newest archive for an older observation.
+        The result identifies the collector-observed version exactly.  It does
+        not claim to know BKK's publication instant between daily checks.
+        """
+        candidates: list[tuple[float, dict[str, Any]]] = []
+        for event in self.history():
+            checked = self._checked_timestamp(event)
+            if checked is not None and checked <= timestamp:
+                candidates.append((checked, event))
+        if not candidates:
+            return None
+        checked, event = max(candidates, key=lambda item: item[0])
+        return {
+            **event,
+            "observed_from": utc_iso(checked),
+            "applicability_confidence": self._applicability_confidence(event),
+        }
+
+    def observed_timeline(self, start_timestamp: float, end_timestamp: float) -> list[dict[str, Any]]:
+        """Describe collector-observed static versions over a half-open range."""
+        if end_timestamp <= start_timestamp:
+            raise ValueError("static GTFS timeline end must be after start")
+        parsed = sorted(
+            (
+                (checked, event)
+                for event in self.history()
+                if (checked := self._checked_timestamp(event)) is not None
+            ),
+            key=lambda item: item[0],
+        )
+        before = [item for item in parsed if item[0] <= start_timestamp]
+        boundaries = ([max(before, key=lambda item: item[0])] if before else []) + [
+            item for item in parsed if start_timestamp < item[0] < end_timestamp
+        ]
+        timeline: list[dict[str, Any]] = []
+        for index, (checked, event) in enumerate(boundaries):
+            effective_from = max(start_timestamp, checked)
+            effective_until = boundaries[index + 1][0] if index + 1 < len(boundaries) else end_timestamp
+            segment = {
+                "effective_from": utc_iso(effective_from),
+                "effective_until": utc_iso(effective_until),
+                "observed_at": event.get("checked_at"),
+                "sha256": event.get("sha256"),
+                "size": event.get("size"),
+                "version_path": event.get("version_path"),
+                "feed_version": event.get("feed_version"),
+                "source": event.get("source"),
+                "applicability_confidence": self._applicability_confidence(event),
+            }
+            # Repeated daily observations of unchanged bytes do not create a
+            # new schedule version. Merge them into one continuous interval.
+            if (
+                timeline
+                and timeline[-1]["sha256"] == segment["sha256"]
+                and timeline[-1]["applicability_confidence"] == segment["applicability_confidence"]
+            ):
+                timeline[-1]["effective_until"] = segment["effective_until"]
+            else:
+                timeline.append(segment)
+        return timeline

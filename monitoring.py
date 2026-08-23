@@ -103,6 +103,8 @@ class HealthMonitor:
         min_entity_timestamp: int | None,
         max_entity_timestamp: int | None,
         parse_ok: bool,
+        change_tracking_ok: bool = True,
+        change_tracking_failure_flag: str | None = None,
         raw_ok: bool,
         spool_ok: bool,
         entity_count: int | None = None,
@@ -140,6 +142,8 @@ class HealthMonitor:
                 flags.append("payload_unchanged_warning")
         if not parse_ok:
             flags.append("protobuf_parse_failed")
+        if not change_tracking_ok:
+            flags.append(change_tracking_failure_flag or "change_tracker_failed")
         if (
             feed_name != "alerts"
             and max_entity_timestamp is not None
@@ -168,6 +172,8 @@ class HealthMonitor:
                 "entity_count": entity_count,
                 "consecutive_failures": 0,
                 "parse_ok": parse_ok,
+                "change_tracking_ok": change_tracking_ok,
+                "change_tracking_failure_flag": change_tracking_failure_flag,
                 "raw_ok": raw_ok,
                 "spool_ok": spool_ok,
                 "freshness_flags": sorted(set(flags)),
@@ -198,20 +204,42 @@ class HealthMonitor:
         pending_spool_segments: int,
         parquet_flush_errors: list[str],
         cycle_errors: list[str],
+        scheduler: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         reasons: list[str] = []
         warnings: list[str] = []
         feed_status: dict[str, Any] = {}
         for feed_name in FEED_NAMES:
             state = dict(self.feeds.get(feed_name, {}))
+            schedule = dict((scheduler or {}).get(feed_name, {}))
             last_success = state.get("last_success_timestamp")
             absence = None if last_success is None else max(0.0, now_ts - float(last_success))
             state["seconds_since_success"] = absence
-            if last_success is None or absence is None or absence > self.absent_seconds:
+            interval = float(schedule.get("interval_seconds") or 0)
+            absence_limit = max(self.absent_seconds, interval * 3)
+            state["absence_threshold_seconds"] = absence_limit
+            if last_success is None or absence is None or absence > absence_limit:
                 reasons.append(f"{feed_name}:absent")
             for flag in state.get("freshness_flags", []):
                 target = warnings if flag.endswith("_warning") else reasons
                 target.append(f"{feed_name}:{flag}")
+            if schedule:
+                in_flight_seconds = schedule.get("in_flight_seconds")
+                if in_flight_seconds is not None and interval and float(in_flight_seconds) > interval:
+                    warnings.append(f"{feed_name}:request_exceeds_cadence")
+                if (
+                    in_flight_seconds is not None
+                    and interval
+                    and float(in_flight_seconds) > max(interval * 3, 60.0)
+                ):
+                    reasons.append(f"{feed_name}:request_stuck")
+                missed = int(schedule.get("missed_since_last_request") or 0)
+                if missed:
+                    warnings.append(f"{feed_name}:scheduler_missed_deadline")
+                next_due = schedule.get("next_deadline_in_seconds")
+                if next_due is not None and interval and float(next_due) < -interval:
+                    reasons.append(f"{feed_name}:scheduler_overdue")
+                state["scheduler"] = schedule
             feed_status[feed_name] = state
         if disk_free_bytes < disk_critical_bytes:
             reasons.append("disk:critical")
@@ -235,6 +263,7 @@ class HealthMonitor:
             "pending_spool_segments": pending_spool_segments,
             "parquet_flush_errors": parquet_flush_errors,
             "cycle_errors": cycle_errors,
+            "scheduler": scheduler or {},
             "feeds": feed_status,
         }
         atomic_write_json(self.status_path, status)

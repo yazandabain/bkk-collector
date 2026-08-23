@@ -632,6 +632,15 @@ class BackupTests(unittest.TestCase):
             "completeness_errors": [],
             "feeds": feeds,
             "static_gtfs": {"version_path": "versions/hash.zip", "sha256": sha256_file(static)},
+            "static_gtfs_timeline": [
+                {
+                    "effective_from": f"{self.date}T00:00:00+00:00",
+                    "effective_until": f"{self.date}T23:59:59+00:00",
+                    "version_path": "versions/hash.zip",
+                    "sha256": sha256_file(static),
+                    "applicability_confidence": "collector_observed",
+                }
+            ],
             "artifacts": artifacts,
         }
         atomic_write_json(self.manifest_path, self.complete_manifest)

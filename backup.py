@@ -74,7 +74,27 @@ class BackupManager:
         return confirmed
 
     def pending_dates(self) -> list[str]:
-        return sorted(set(discover_completed_dates(self.data_dir)) - self.confirmed_dates())
+        # Explicitly inventoried legacy dates use separate, non-scientific
+        # receipts and must not be rebuilt forever as impossible v2 manifests.
+        # They are also never returned by confirmed_dates(), so pruning cannot
+        # mistake a legacy copy for verified complete collection evidence.
+        inventory = read_json(self.data_dir / "metadata" / "legacy_inventory.json", {})
+        handled_legacy: set[str] = set()
+        if inventory.get("inventory_version") == 1 and inventory.get("inventory_complete") is True:
+            for item in inventory.get("dates", []):
+                if (
+                    isinstance(item, dict)
+                    and item.get("inventory_complete") is True
+                    and item.get("legacy_handled") is True
+                    and item.get("classification") != "v2_complete"
+                    and isinstance(item.get("date"), str)
+                ):
+                    handled_legacy.add(item["date"])
+        return sorted(
+            set(discover_completed_dates(self.data_dir))
+            - self.confirmed_dates()
+            - handled_legacy
+        )
 
     def _local_artifacts(self, date_str: str, manifest: dict[str, Any]) -> list[dict[str, Any]]:
         artifacts = list(manifest["artifacts"])
@@ -113,7 +133,14 @@ class BackupManager:
         feeds = manifest.get("feeds")
         artifacts = manifest.get("artifacts")
         static = manifest.get("static_gtfs")
-        if not isinstance(feeds, dict) or not isinstance(artifacts, list) or not isinstance(static, dict):
+        timeline = manifest.get("static_gtfs_timeline")
+        if (
+            not isinstance(feeds, dict)
+            or not isinstance(artifacts, list)
+            or not isinstance(static, dict)
+            or not isinstance(timeline, list)
+            or not timeline
+        ):
             raise ValueError("daily manifest is missing feed, artifact, or static GTFS evidence")
         artifact_paths = {
             artifact.get("path")
@@ -143,6 +170,10 @@ class BackupManager:
         version_path = static.get("version_path")
         if not isinstance(version_path, str) or f"static_gtfs/{version_path}" not in artifact_paths:
             raise ValueError("daily manifest lacks its applicable static GTFS archive")
+        for segment in timeline:
+            timeline_path = segment.get("version_path") if isinstance(segment, dict) else None
+            if not isinstance(timeline_path, str) or f"static_gtfs/{timeline_path}" not in artifact_paths:
+                raise ValueError("daily manifest lacks an archive from its static GTFS timeline")
 
     @staticmethod
     def _remote_path(info: Any) -> str | None:
@@ -320,7 +351,11 @@ class BackupManager:
     def _load_or_build_manifest(self, date_str: str) -> dict[str, Any]:
         path = self.data_dir / "metadata" / "manifests" / f"date={date_str}.json"
         manifest = read_json(path, {})
-        if manifest.get("complete") and manifest.get("artifacts"):
+        if (
+            manifest.get("complete")
+            and manifest.get("artifacts")
+            and manifest.get("static_gtfs_timeline")
+        ):
             current = True
             for artifact in manifest["artifacts"]:
                 local = self.data_dir / artifact["path"]

@@ -15,6 +15,13 @@ from dedup import ChangeTracker
 from gtfs_rt_parse import PARSERS, parse_feed
 from parquet_store import write_parquet_atomic
 from raw_log import iter_records, scan_raw_log
+from trip_update_policy import (
+    TRIP_UPDATE_DELAY_FIELDS,
+    TRIP_UPDATE_EXACT_MUTABLE_FIELDS,
+    TRIP_UPDATE_KEY_FIELDS,
+    TRIP_UPDATE_PREDICTION_TIME_FIELDS,
+    TRIP_UPDATE_TOLERANT_NUMERIC_FIELDS,
+)
 
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
@@ -22,23 +29,32 @@ RAW_DIR = DATA_DIR / "raw"
 PARQUET_DIR = DATA_DIR / "parquet"
 HEARTBEAT_SECONDS = int(os.environ.get("HEARTBEAT_SECONDS", "1800"))
 DELAY_CHANGE_THRESHOLD_SECONDS = int(os.environ.get("DELAY_CHANGE_THRESHOLD_SECONDS", "15"))
+PREDICTION_TIME_CHANGE_THRESHOLD_SECONDS = int(
+    os.environ.get(
+        "TRIPUPDATE_TIME_TOLERANCE_SECONDS",
+        os.environ.get("PREDICTION_TIME_CHANGE_THRESHOLD_SECONDS", "5"),
+    )
+)
+BKK_STOP_DISTANCE_CHANGE_THRESHOLD = int(
+    os.environ.get("BKK_STOP_DISTANCE_CHANGE_THRESHOLD", str(DELAY_CHANGE_THRESHOLD_SECONDS))
+)
+CHANGE_TRACKER_NULL_GUARD_ROWS = int(os.environ.get("CHANGE_TRACKER_NULL_GUARD_ROWS", "1000"))
 
 
 def make_tracker(feed_name: str) -> ChangeTracker | None:
     if feed_name == "tripupdates":
         return ChangeTracker(
-            key_fields=(
-                "entity_id", "trip_id", "start_date", "start_time", "stop_sequence",
-                "stop_visit_fallback_index", "stop_id",
-            ),
-            value_fields=(
-                "route_id", "direction_id", "schedule_relationship", "vehicle_id",
-                "stop_schedule_relationship", "departure_occupancy_status", "stop_time_properties_json",
-                "arrival_uncertainty", "departure_uncertainty",
-                "bkk_scheduled_arrival_time", "bkk_scheduled_departure_time",
-            ),
-            numeric_tolerance_fields=("arrival_delay", "departure_delay", "trip_delay", "arrival_time", "departure_time"),
+            key_fields=TRIP_UPDATE_KEY_FIELDS,
+            value_fields=TRIP_UPDATE_EXACT_MUTABLE_FIELDS,
+            numeric_tolerance_fields=TRIP_UPDATE_TOLERANT_NUMERIC_FIELDS,
             tolerance=DELAY_CHANGE_THRESHOLD_SECONDS,
+            numeric_tolerances={
+                "arrival_time": PREDICTION_TIME_CHANGE_THRESHOLD_SECONDS,
+                "departure_time": PREDICTION_TIME_CHANGE_THRESHOLD_SECONDS,
+                "bkk_stop_distance": BKK_STOP_DISTANCE_CHANGE_THRESHOLD,
+            },
+            required_signal_fields=TRIP_UPDATE_DELAY_FIELDS + TRIP_UPDATE_PREDICTION_TIME_FIELDS,
+            null_guard_min_rows=CHANGE_TRACKER_NULL_GUARD_ROWS,
             heartbeat_seconds=HEARTBEAT_SECONDS,
         )
     if feed_name == "alerts":

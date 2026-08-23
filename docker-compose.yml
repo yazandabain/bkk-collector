@@ -8,7 +8,7 @@ services:
       - .env
     volumes:
       - ./data:/data
-    mem_limit: 1536m
+    mem_limit: ${COLLECTOR_MEMORY_LIMIT:-1536m}
     stop_grace_period: 60s
     healthcheck:
       test: ["CMD", "python", "healthcheck.py"]
@@ -32,7 +32,7 @@ services:
       - .env
     volumes:
       - ./data:/data
-    mem_limit: 1536m
+    mem_limit: ${MAINTENANCE_MEMORY_LIMIT:-1536m}
     stop_grace_period: 60s
     healthcheck:
       test: ["CMD", "python", "maintenance_healthcheck.py"]
