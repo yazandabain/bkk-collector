@@ -8,6 +8,7 @@ import json
 import os
 import time
 import uuid
+from itertools import islice
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,7 @@ INT_COLUMNS = {
     "affected_trip_schedule_relationship",
 }
 MAX_SEGMENTS_PER_COMMIT = 20
+PARQUET_WRITE_BATCH_ROWS = 4096
 
 
 def parquet_schema(feed_name: str):
@@ -114,13 +116,16 @@ def rows_to_table(feed_name: str, rows: list[dict[str, Any]]):
     return pa.Table.from_pydict(columns, schema=schema)
 
 
-def write_parquet_atomic(feed_name: str, rows: list[dict[str, Any]], path: Path) -> None:
+def write_parquet_atomic(feed_name: str, rows, path: Path) -> None:
     import pyarrow.parquet as pq
 
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
     try:
-        pq.write_table(rows_to_table(feed_name, rows), temporary, compression="zstd", write_statistics=True)
+        iterator = iter(rows)
+        with pq.ParquetWriter(temporary, parquet_schema(feed_name), compression="zstd", write_statistics=True) as writer:
+            while batch := list(islice(iterator, PARQUET_WRITE_BATCH_ROWS)):
+                writer.write_table(rows_to_table(feed_name, batch))
         with open(temporary, "rb") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -248,9 +253,14 @@ class DurableParquetSpool:
         segments: list[Path],
         result: FlushResult,
     ) -> None:
-        rows: list[dict[str, Any]] = []
-        for segment in segments:
-            rows.extend(self._read_segment(segment))
+        # Two bounded passes: establish the recovery invariant before writing,
+        # then stream one decoded poll at a time into small Arrow row groups.
+        # No twenty-poll list or full-commit Arrow table exists in memory.
+        expected_rows = sum(len(self._read_segment(segment)) for segment in segments)
+
+        def rows():
+            for segment in segments:
+                yield from self._read_segment(segment)
         identity = "\n".join(path.name for path in segments).encode("utf-8")
         digest = hashlib.sha256(identity).hexdigest()[:20]
         out_dir = self.parquet_dir / feed_name / f"date={date_str}"
@@ -264,19 +274,19 @@ class DurableParquetSpool:
                 "date": date_str,
                 "sources": [path.name for path in segments],
                 "output": out_path.name,
-                "expected_rows": len(rows),
+                "expected_rows": expected_rows,
             },
         )
-        if not out_path.exists() or parquet_row_count(out_path) != len(rows):
-            write_parquet_atomic(feed_name, rows, out_path)
-        if parquet_row_count(out_path) != len(rows):
+        if not out_path.exists() or parquet_row_count(out_path) != expected_rows:
+            write_parquet_atomic(feed_name, rows(), out_path)
+        if parquet_row_count(out_path) != expected_rows:
             raise IOError(f"row-count validation failed for {out_path}")
         for segment in segments:
             segment.unlink()
         marker.unlink()
         fsync_directory(segments[0].parent)
         result.files_written.append(out_path)
-        result.rows_written += len(rows)
+        result.rows_written += expected_rows
 
     def flush(self, *, force: bool = False) -> FlushResult:
         result = FlushResult()

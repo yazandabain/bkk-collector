@@ -84,12 +84,25 @@ class ChangeTracker:
         # key -> (exact_values_tuple, numeric_values_tuple, last_written_unix_ts)
         self._last: dict = {}
         self._day: Optional[str] = None
+        self._last_expiry = float("-inf")
 
     def _maybe_reset(self, date_str: str) -> None:
         # Bounds memory and matches the daily partitioning used everywhere else.
         if self._day != date_str:
             self._last = {}
             self._day = date_str
+            self._last_expiry = float("-inf")
+
+    def _expire_heartbeat_entries(self, now_ts: float) -> None:
+        # An entry older than its heartbeat MUST emit on its next observation,
+        # regardless of values. Forgetting it has exactly that same outcome.
+        # Retaining a whole day's departed trips caused production OOM kills.
+        if now_ts - self._last_expiry >= min(60, self.heartbeat_seconds):
+            expired = [key for key, value in self._last.items()
+                       if now_ts - value[2] >= self.heartbeat_seconds]
+            for key in expired:
+                del self._last[key]
+            self._last_expiry = now_ts
 
     def _numeric_changed(self, prev_vals: tuple, new_vals: tuple) -> bool:
         for field, prev, new in zip(self.numeric_tolerance_fields, prev_vals, new_vals):
@@ -114,6 +127,7 @@ class ChangeTracker:
         retry on the next poll.
         """
         self._maybe_reset(date_str)
+        self._expire_heartbeat_entries(now_ts)
         if rows:
             if any(
                 row.get(field) is not None
@@ -130,13 +144,15 @@ class ChangeTracker:
                         f"{', '.join(self.required_signal_fields)}"
                     )
         out = []
-        prospective = dict(self._last)
+        # Only this poll's changes need an overlay. Copying the entire daily
+        # dictionary on every poll amplified both memory and scheduler latency.
+        prospective = {}
         for row in rows:
             key = tuple(row.get(f) for f in self.key_fields)
             exact_vals = tuple(row.get(f) for f in self.value_fields)
             numeric_vals = tuple(row.get(f) for f in self.numeric_tolerance_fields)
 
-            prev = prospective.get(key)
+            prev = prospective.get(key, self._last.get(key))
             if prev is None:
                 write = True
             else:
@@ -151,7 +167,7 @@ class ChangeTracker:
                 out.append(row)
                 prospective[key] = (exact_vals, numeric_vals, now_ts)
         if update:
-            self._last = prospective
+            self._last.update(prospective)
         return out
 
     def commit(self, rows: list, date_str: str, now_ts: float) -> None:

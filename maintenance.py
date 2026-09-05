@@ -114,6 +114,7 @@ class MaintenanceWorker:
         results = self.backup.run_backlog(max_upload_attempts=self.config.backup_max_dates_per_run)
         self.last_backup_results = [result.__dict__ for result in results]
         removed = self.backup.prune_confirmed_raw(self.config.prune_local_raw_after_days)
+        removed += self.backup.prune_confirmed_parquet(self.config.prune_local_parquet_after_days)
         for path in removed:
             self.logger.info("Pruned local %s after receipt-backed remote verification", path)
 

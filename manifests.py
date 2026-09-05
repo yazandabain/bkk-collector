@@ -86,7 +86,12 @@ def _feed_stats(data_dir: Path, feed_name: str, date_str: str, *, create_empty: 
     parse_failures = len(responses) - len(parse_successes)
     if parse_failures:
         quality_flags.append(f"{feed_name}: {parse_failures} parse failure(s)")
-    stale_incidents = sum(1 for event in responses if event.get("freshness_flags"))
+    stale_incidents = sum(1 for event in responses if any(
+        not flag.endswith("_warning") for flag in event.get("freshness_flags", [])
+    ))
+    freshness_warning_polls = sum(1 for event in responses if any(
+        flag.endswith("_warning") for flag in event.get("freshness_flags", [])
+    ))
     if stale_incidents:
         quality_flags.append(f"{feed_name}: {stale_incidents} freshness incident poll(s)")
 
@@ -162,6 +167,7 @@ def _feed_stats(data_dir: Path, feed_name: str, date_str: str, *, create_empty: 
         "parquet_rows": parquet_rows,
         "parquet_files": len(parquet_files),
         "stale_feed_polls": stale_incidents,
+        "freshness_warning_polls": freshness_warning_polls,
         "corrupt_journal_lines": corrupt_journal_lines,
         "pending_spool_segments": len(pending_spool),
         "scheduler_missed_deadlines": sum(

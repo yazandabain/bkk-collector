@@ -195,7 +195,7 @@ class ReliabilityTests(unittest.TestCase):
             def fake_write(_feed, rows, path):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"valid-for-mocked-counter")
-                row_counts[path] = len(rows)
+                row_counts[path] = sum(1 for _ in rows)
 
             with patch("parquet_store.write_parquet_atomic", side_effect=fake_write), patch(
                 "parquet_store.parquet_row_count", side_effect=lambda path: row_counts[path]
@@ -215,7 +215,7 @@ class ReliabilityTests(unittest.TestCase):
             def fake_write(_feed, rows, path):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"valid-for-mocked-counter")
-                row_counts[path] = len(rows)
+                row_counts[path] = sum(1 for _ in rows)
 
             with patch("parquet_store.write_parquet_atomic", side_effect=fake_write), patch(
                 "parquet_store.parquet_row_count", side_effect=lambda path: row_counts[path]
@@ -559,6 +559,12 @@ class FakeBackupApi:
         self.wrong_size = wrong_size
         self.uploaded: list[str] = []
         self.remote: dict[str, tuple[int, str]] = {}
+        self.revisions = {}
+
+    def repo_info(self, **_kwargs):
+        revision = f"{len(self.uploaded):040x}"
+        self.revisions[revision] = dict(self.remote)
+        return SimpleNamespace(sha=revision)
 
     def create_repo(self, **_kwargs):
         return None
@@ -570,12 +576,13 @@ class FakeBackupApi:
         source = Path(path_or_fileobj)
         self.remote[path_in_repo] = (source.stat().st_size, sha256_file(source))
 
-    def get_paths_info(self, *, paths, **_kwargs):
+    def get_paths_info(self, *, paths, revision=None, **_kwargs):
         infos = []
+        remote = self.revisions[revision] if revision is not None else self.remote
         for path in paths:
-            if path not in self.remote:
+            if path not in remote:
                 continue
-            stored_size, stored_sha = self.remote[path]
+            stored_size, stored_sha = remote[path]
             size = stored_size + (1 if self.wrong_size else 0)
             infos.append(SimpleNamespace(path=path, size=size, lfs=SimpleNamespace(sha256=stored_sha)))
         return infos

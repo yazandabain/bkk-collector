@@ -132,8 +132,15 @@ class HealthMonitor:
             stale_seconds=self.stale_seconds,
             frozen_seconds=frozen,
         )
-        # Alerts are commonly and legitimately empty. A stable empty entity set
-        # is not evidence of a frozen feed when its header timestamp advances.
+        # Alerts are event-driven: an unchanged source timestamp is advisory.
+        # HTTP absence, parse and storage failures remain liveness failures.
+        if feed_name == "alerts":
+            header_stale = any(flag in flags for flag in
+                               ("source_timestamp_stale", "source_timestamp_frozen"))
+            flags = [flag for flag in flags if flag not in
+                     ("source_timestamp_stale", "source_timestamp_frozen")]
+            if header_stale:
+                flags.append("source_timestamp_unchanged_warning")
         if feed_name == "alerts" and "payload_frozen" in flags:
             flags = [flag for flag in flags if flag != "payload_frozen"]
             if entity_count:
@@ -220,6 +227,8 @@ class HealthMonitor:
             state["absence_threshold_seconds"] = absence_limit
             if last_success is None or absence is None or absence > absence_limit:
                 reasons.append(f"{feed_name}:absent")
+            if int(state.get("consecutive_failures", 0)):
+                reasons.append(f"{feed_name}:http_failed")
             for flag in state.get("freshness_flags", []):
                 target = warnings if flag.endswith("_warning") else reasons
                 target.append(f"{feed_name}:{flag}")

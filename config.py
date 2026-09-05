@@ -53,8 +53,8 @@ class CollectorConfig:
     bkk_stop_distance_change_threshold: int | None = None
     change_tracker_null_guard_rows: int = 1000
     heartbeat_seconds: int = 1800
-    disk_warn_free_gb: float = 2.0
-    disk_critical_free_gb: float = 0.5
+    disk_warn_free_gb: float = 8.0
+    disk_critical_free_gb: float = 4.0
     connect_timeout_seconds: float = 5.0
     read_timeout_seconds: float = 15.0
     http_connect_retries: int = 1
@@ -165,8 +165,8 @@ class CollectorConfig:
             ),
             change_tracker_null_guard_rows=int(os.environ.get("CHANGE_TRACKER_NULL_GUARD_ROWS", "1000")),
             heartbeat_seconds=int(os.environ.get("HEARTBEAT_SECONDS", "1800")),
-            disk_warn_free_gb=float(os.environ.get("DISK_WARN_FREE_GB", "2.0")),
-            disk_critical_free_gb=float(os.environ.get("DISK_CRITICAL_FREE_GB", "0.5")),
+            disk_warn_free_gb=float(os.environ.get("DISK_WARN_FREE_GB", "8.0")),
+            disk_critical_free_gb=float(os.environ.get("DISK_CRITICAL_FREE_GB", "4.0")),
             connect_timeout_seconds=float(os.environ.get("HTTP_CONNECT_TIMEOUT_SECONDS", "5")),
             read_timeout_seconds=float(os.environ.get("HTTP_READ_TIMEOUT_SECONDS", "15")),
             http_connect_retries=int(os.environ.get("HTTP_CONNECT_RETRIES", "1")),
@@ -227,7 +227,8 @@ class MaintenanceConfig:
     backup_retry_seconds: float = 900.0
     backup_max_dates_per_run: int = 7
     backup_date_grace_minutes: int = 30
-    prune_local_raw_after_days: int = 14
+    prune_local_raw_after_days: int = 3
+    prune_local_parquet_after_days: int = 7
     static_check_interval_seconds: float = 86400.0
     static_retry_seconds: float = 3600.0
     maintenance_interval_seconds: float = 60.0
@@ -258,6 +259,8 @@ class MaintenanceConfig:
             raise ValueError("BACKUP_DATE_GRACE_MINUTES must be below 1440")
         if self.prune_local_raw_after_days < 0:
             raise ValueError("PRUNE_LOCAL_RAW_AFTER_DAYS must not be negative")
+        if self.prune_local_parquet_after_days < 0:
+            raise ValueError("PRUNE_LOCAL_PARQUET_AFTER_DAYS must not be negative")
         if self.compaction_min_files < 2:
             raise ValueError("PARQUET_COMPACTION_MIN_FILES must be at least 2")
 
@@ -271,7 +274,8 @@ class MaintenanceConfig:
             backup_retry_seconds=float(os.environ.get("BACKUP_RETRY_SECONDS", "900")),
             backup_max_dates_per_run=int(os.environ.get("BACKUP_MAX_DATES_PER_RUN", "7")),
             backup_date_grace_minutes=int(os.environ.get("BACKUP_DATE_GRACE_MINUTES", "30")),
-            prune_local_raw_after_days=int(os.environ.get("PRUNE_LOCAL_RAW_AFTER_DAYS", "14")),
+            prune_local_raw_after_days=int(os.environ.get("PRUNE_LOCAL_RAW_AFTER_DAYS", "3")),
+            prune_local_parquet_after_days=int(os.environ.get("PRUNE_LOCAL_PARQUET_AFTER_DAYS", "7")),
             static_check_interval_seconds=float(os.environ.get("STATIC_GTFS_CHECK_INTERVAL_SECONDS", "86400")),
             static_retry_seconds=float(os.environ.get("STATIC_GTFS_RETRY_SECONDS", "3600")),
             maintenance_interval_seconds=float(os.environ.get("MAINTENANCE_INTERVAL_SECONDS", "60")),

@@ -42,6 +42,9 @@ Meaningful schedule, trip-property, vehicle-assignment, uncertainty, stop-state,
 and BKK-extension changes emit rows. Delay, predicted-time, and stop-distance
 noise uses the configured tolerance against the last durably staged value.
 Per-request/feed timestamps and enum-name aliases do not manufacture changes.
+Tracker entries expire once their 30-minute heartbeat has elapsed: the next
+observation would already have to emit, so this bounds departed-trip memory
+without changing the comparison or heartbeat decision.
 If an upstream stop update omits `stop_sequence`, its list ordinal is retained
 as an explicit fallback identity rather than collapsing repeated stop IDs.
 
@@ -115,8 +118,8 @@ change-tracking, raw/spool writes, poll journals, and health state. This avoids
 cross-feed durability races. As each response finishes, it is archived
 before parsing when that feed's raw interval is due. A parse or spool failure
 forces a raw snapshot for that poll. Derived rows are written to small atomic,
-gzip-compressed spool segments; bounded-size commits prevent a long failed-write
-backlog from being loaded into RAM at once. A successful, validated atomic
+gzip-compressed spool segments. Commits decode one segment at a time and write
+at most 4,096 rows per Arrow batch. A successful, validated atomic
 Parquet commit is the only event that removes those segments.
 
 `maintenance` is a separate process/container. It performs:
@@ -125,7 +128,7 @@ Parquet commit is the only event that removes those segments.
 - completed-day Parquet compaction;
 - daily manifest generation and validation;
 - Hugging Face uploads and remote verification;
-- receipt-gated local raw pruning;
+- receipt-gated local raw and Parquet pruning;
 - external healthcheck pings.
 
 A hung/crashed upload may delay backup, but cannot delay realtime polling.
@@ -153,6 +156,11 @@ Docker restarts the two processes independently.
   `fsync` and atomic rename.
 - Compaction writes and validates its output before deleting source parts. A
   transaction marker completes cleanup after a crash.
+
+An OOM or machine crash can still lose a response before its raw/spool write
+finishes. Restart may emit extra initial/heartbeat rows; durable staged rows
+survive. The September operational audit found five production OOM kills and
+removed whole-day tracker retention and whole-commit row materialization.
 
 ## Data layout
 
@@ -232,12 +240,12 @@ completed local dates - dates with verified v2 receipts
 
 The worker retries older failures automatically. Explicitly inventoried legacy
 dates use a separate path described below and cannot starve newer complete v2
-dates. It uploads each
-manifest-listed file idempotently, then checks every remote path and size.
-For Hugging Face LFS objects it also compares the remote LFS SHA-256. A local
-receipt is written only after all checks pass. Non-LFS remote verification is
-path+size (the manifest still stores the local SHA-256), so do not interpret it
-as an independent download-and-rehash proof.
+dates. It uploads each manifest-listed file idempotently, then checks every
+remote path, size, and SHA-256 at one immutable HF Git commit. LFS objects use
+the server's SHA-256; ordinary Git files are downloaded and hashed in chunks.
+Receipts retain format version 2 and add `remote_revision`, which fixes the
+restoration version even when later backups update static history/state.
+An already confirmed receipt is not overwritten by an explicit backup retry.
 The receipt is itself uploaded and remotely verified before its local final
 name is installed.
 
@@ -276,10 +284,54 @@ it cannot consume retry time needed by newer dates. If credentials were absent,
 the maintenance status warns that its remote copy is unconfirmed; rerun the
 same command after configuring credentials.
 
-When `PRUNE_LOCAL_RAW_AFTER_DAYS` is positive, raw date directories older than
-that age are removed only if a receipt exists and every still-local raw file
-still matches the receipt. Parquet, manifests, static GTFS, and receipts are not
-auto-pruned. Set the value to `0` for no automatic raw pruning.
+Local working-cache defaults are `PRUNE_LOCAL_RAW_AFTER_DAYS=3` and
+`PRUNE_LOCAL_PARQUET_AFTER_DAYS=7`; each can be disabled with `0`. A date must be
+strictly older than `today_UTC - retention_days`. Thus seven completed dates
+plus today's partial date remain for Parquet. Existing environment overrides
+continue to win.
+
+Before deleting any file in a date, maintenance validates the receipt identity,
+its authenticated complete manifest, all three feed inventories, every candidate
+size and SHA-256, absence of extra files/symlinks/subdirectories, and absence of
+pending spool work. It rechecks the remote receipt and remote candidate hashes
+at a fixed revision, then repeats local validation after network checks.
+An offline HF endpoint or any mismatch refuses the date and retries later.
+Refusals are logged; they do not crash maintenance. Disk pressure remains
+unhealthy if refused data accumulates. No recursive directory deletion is used.
+
+All validation precedes any deletion. A filesystem cannot atomically unlink
+three feed partitions: a crash or unlink error during deletion can leave a
+partially evicted *verified* cache. A fsynced intent records the planned files
+and revision; restart revalidates the remaining files and remote evidence before
+resuming. `prune_history.jsonl` and `maintenance/prune-KIND-DATE.json` record
+operation (`raw_prune`/`parquet_prune`), timestamp, date, deleted files and bytes,
+and completion/interruption. Only explicitly validated regular files are removed.
+
+Parquet pruning cannot remove raw, receipts, manifests, journals, static GTFS,
+or spool state. Unverified legacy dates remain indefinitely. Do not run a
+manual historical rebuild or a second maintenance worker concurrently with
+maintenance; the retention lock only serializes pruners.
+
+Restore/authentication check (temporary downloads are automatically removed):
+
+```bash
+docker compose run --rm --no-deps maintenance python verify_backup.py 2026-09-03
+# Optional: download and authenticate every artifact rather than representatives.
+docker compose run --rm --no-deps maintenance python verify_backup.py 2026-09-03 --all
+```
+
+The command verifies every remote artifact's hash and downloads representatives
+including an actual `.rawlog`, Parquet, static ZIP, manifest, journal, and static
+history/state. Old v2 receipts lacking a revision are resolved to the historical
+receipt-upload commit and checked against the local receipt hash. Restoring
+old static metadata from HF `main` is incorrect: those paths are mutable.
+
+The [September 2026 operational audit](docs/ops/retention-recovery-audit-2026-09-05.md)
+contains measured coverage, recovery hashes and production upgrade/rollback
+commands. Large raw/Parquet caches are bounded only when backup succeeds.
+Protected static versions and poll journals still add about 71MB/day at the
+audited workload. Plan at least 64GB usable disk for a nine-month run and check
+the actual free-space trend weekly; 38GB is not a comfortable long-term target.
 
 Hugging Face is one off-server copy, not a complete 3-2-1 backup strategy. For
 irreplaceable research, periodically replicate the dataset repo to a second
@@ -333,11 +385,13 @@ HTTP 200 alone is not healthy. The collector persists and evaluates:
 - per-feed scheduler lag, in-flight duration, and coalesced missed deadlines;
 - free disk space.
 
-Alerts use a one-day default unchanged-payload warning, and empty Alerts
-content does not trigger it while its header advances, because legitimately
-unchanged alerts are common. That warning is evidence in feed status/manifests,
-not a liveness failure by itself. Tune thresholds if BKK's header semantics
-produce false positives; do not disable absence/disk checks casually.
+Alerts use advisory flags for unchanged/stale source timestamps and a one-day
+unchanged-content warning (empty content does not trigger the latter). Their
+HTTP, absence, parse, raw, and spool failures remain unhealthy. VP/TU timestamp
+and payload freshness checks remain strict. Daily manifests distinguish
+`freshness_warning_polls` from `stale_feed_polls`; old immutable manifests are
+not rewritten. A current failed HTTP request is unhealthy until a successful
+response clears it.
 
 Docker marks `collector` unhealthy when `health/status.json` is stale or
 degraded. `maintenance` independently checks daily static freshness and a stale
@@ -373,7 +427,8 @@ backup backlog requires investigation.
 The 1536 MiB Compose values are limits, not reservations. They remain at the
 existing conservative defaults. Raw/static hashing and downloads stream in
 1 MiB blocks; rebuilds use bounded row chunks; compaction iterates 65,536-row
-record batches; spool commits consume at most 20 segments. Daily journals are
+record batches; spool commits group at most 20 segments but decode only one
+at a time, with Arrow batches capped at 4,096 rows. Daily journals are
 the only completed-day structure materialized by manifest generation and are
 small enough at the supported cadence. Use `docker stats` to look for a rising
 baseline or a maintenance process repeatedly approaching its limit. An OOM in
@@ -417,14 +472,15 @@ variables all have safe defaults; the most important are:
 | `HF_TOKEN`, `HF_REPO_ID` | empty | enable private dataset backup |
 | `BACKUP_HOUR_UTC` | `3` | earliest daily backup hour |
 | `BACKUP_RETRY_SECONDS` | `900` | pending backlog retry interval |
-| `PRUNE_LOCAL_RAW_AFTER_DAYS` | `14` | receipt-gated raw retention; `0` disables |
+| `PRUNE_LOCAL_RAW_AFTER_DAYS` | `3` | verified raw retention; `0` disables |
+| `PRUNE_LOCAL_PARQUET_AFTER_DAYS` | `7` | verified Parquet retention; `0` disables |
 | `STATIC_GTFS_CHECK_INTERVAL_SECONDS` | `86400` | successful static check interval |
 | `FEED_STALE_SECONDS` | `180` | source timestamp age limit |
 | `FEED_ABSENT_SECONDS` | `180` | no-success limit |
 | `FROZEN_PAYLOAD_SECONDS` | `300` | VP/TU unchanged limit |
 | `ALERTS_FROZEN_PAYLOAD_SECONDS` | `86400` | Alerts unchanged warning limit |
-| `DISK_WARN_FREE_GB` | `2.0` | unhealthy warning threshold |
-| `DISK_CRITICAL_FREE_GB` | `0.5` | critical disk threshold |
+| `DISK_WARN_FREE_GB` | `8.0` | unhealthy warning threshold (decimal GB) |
+| `DISK_CRITICAL_FREE_GB` | `4.0` | critical disk threshold (decimal GB) |
 | `PARQUET_COMPACTION_ENABLED` | `true` | completed-day background compaction |
 | `HEALTHCHECK_URL` | empty | optional external dead-man ping |
 | `COLLECTOR_MEMORY_LIMIT` | `1536m` | Compose collector memory limit |
@@ -453,8 +509,9 @@ large.
 
 ## Safe upgrade from collector v1
 
-Building and legacy inventory do not stop the realtime service, so do both
-first. Do not overwrite the server's existing `.env`; add the three explicit
+Building does not stop the realtime service. Legacy inventory is optional;
+the best-effort Aug 18–22 dates do not need migration. Do not overwrite the
+server's existing `.env`; add the three explicit
 cadences. A remaining `POLL_INTERVAL_SECONDS` is harmless and deprecated because
 feed-specific values win. Set pruning to zero for the first 24–48 hours while
 you inspect v2 receipts.
@@ -469,6 +526,7 @@ TRIPUPDATES_RAW_ARCHIVE_SECONDS=300
 TRIPUPDATE_TIME_TOLERANCE_SECONDS=2
 CHANGE_TRACKER_NULL_GUARD_ROWS=1000
 PRUNE_LOCAL_RAW_AFTER_DAYS=0
+PRUNE_LOCAL_PARQUET_AFTER_DAYS=0
 ```
 
 ```bash
@@ -479,8 +537,6 @@ docker compose build
 docker compose run --rm --no-deps collector python -m unittest discover -s tests -v
 docker compose config --quiet
 docker compose stop maintenance
-docker compose run --rm --no-deps maintenance python migrate_legacy.py --dry-run
-docker compose run --rm --no-deps maintenance python migrate_legacy.py
 docker compose up -d --no-deps collector
 docker compose up -d maintenance
 docker compose ps
@@ -501,8 +557,8 @@ Failure handling is intentionally isolated:
 - maintenance OOM/restart leaves atomic download/compaction state retryable and
   cannot consume the collector container's memory limit;
 - staged Parquet survives collector restart and commits before normal polling;
-- low/critical disk, write failures, stale HTTP-200 data, and scheduler misses
-  make data health unhealthy instead of being hidden by process liveness;
+- low/critical disk, write failures and stale VP/TU data make health unhealthy;
+  isolated scheduler skips are warnings, while stuck/overdue scheduling fails health;
 - a missing/changed realCity extension yields nullable derived columns while raw
   bytes preserve the unknown message;
 - a request slower than its interval skips/coalesces that feed's deadlines,
