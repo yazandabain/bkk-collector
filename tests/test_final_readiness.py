@@ -70,6 +70,10 @@ class MemoryRemoteApi:
         self.remote: dict[str, tuple[int, str]] = {}
         self.uploaded: list[str] = []
 
+    def repo_info(self, **_kwargs):
+        from types import SimpleNamespace
+        return SimpleNamespace(sha="a" * 40)
+
     def create_repo(self, **_kwargs):
         return None
 

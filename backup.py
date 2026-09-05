@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
+import hashlib
+import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -66,9 +66,13 @@ class BackupManager:
         for path in self.receipts_dir.glob("date=*.json"):
             receipt = read_json(path, {})
             if (
-                receipt.get("version") == 2
+                isinstance(receipt, dict)
+                and receipt.get("version") == 2
                 and receipt.get("remote_verified") is True
                 and receipt.get("repo_id") == self.repo_id
+                and receipt.get("date") == path.name.removeprefix("date=").removesuffix(".json")
+                and isinstance(receipt.get("artifacts"), list)
+                and bool(receipt["artifacts"])
             ):
                 confirmed.add(path.name.removeprefix("date=").removesuffix(".json"))
         return confirmed
@@ -111,11 +115,13 @@ class BackupManager:
         return [deduplicated[path] for path in sorted(deduplicated)]
 
     def _validate_local(self, artifacts: list[dict[str, Any]], *, verify_hashes: bool = True) -> None:
+        from retention import safe_path
+
         for artifact in artifacts:
             relative = Path(artifact["path"])
             if relative.is_absolute() or ".." in relative.parts:
                 raise ValueError(f"unsafe backup artifact path: {artifact['path']}")
-            path = self.data_dir / relative
+            path = safe_path(self.data_dir, artifact["path"])
             if path.is_symlink():
                 raise ValueError(f"refusing symlinked backup artifact: {artifact['path']}")
             if not path.is_file():
@@ -194,7 +200,34 @@ class BackupManager:
             return lfs.get("sha256")
         return getattr(lfs, "sha256", None) if lfs else None
 
-    def _verify_remote(self, artifacts: list[dict[str, Any]]) -> None:
+    def remote_revision(self) -> str:
+        revision = self.api.repo_info(repo_id=self.repo_id, repo_type="dataset").sha
+        if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError("HF did not return an immutable commit revision")
+        return revision
+
+    def _download_sha256(self, path: str, revision: str) -> str:
+        """Verify ordinary Git files too; equal size is not equal content."""
+        import requests
+        from huggingface_hub import hf_hub_url
+
+        digest = hashlib.sha256()
+        try:
+            with requests.get(
+                hf_hub_url(self.repo_id, path, repo_type="dataset", revision=revision),
+                headers={"Authorization": f"Bearer {self.token}"},
+                stream=True, timeout=(10, 60),
+            ) as response:
+                response.raise_for_status()
+                for chunk in response.iter_content(1024 * 1024):
+                    digest.update(chunk)
+        except requests.RequestException as error:
+            # Response exceptions can contain signed storage URLs.
+            raise IOError(f"remote download failed: {type(error).__name__}") from None
+        return digest.hexdigest()
+
+    def _verify_remote(self, artifacts: list[dict[str, Any]], *, revision: str | None = None) -> None:
+        revision = revision or self.remote_revision()
         expected = {artifact["path"]: artifact for artifact in artifacts}
         returned: dict[str, Any] = {}
         paths = list(expected)
@@ -203,6 +236,7 @@ class BackupManager:
                 repo_id=self.repo_id,
                 paths=paths[start : start + 100],
                 repo_type="dataset",
+                revision=revision,
             )
             for info in infos:
                 remote_path = self._remote_path(info)
@@ -215,8 +249,9 @@ class BackupManager:
             if self._remote_size(info) != artifact["size"]:
                 raise IOError(f"remote size mismatch for {path}")
             lfs_sha = self._remote_lfs_sha(info)
-            if lfs_sha and lfs_sha != artifact["sha256"]:
-                raise IOError(f"remote LFS checksum mismatch for {path}")
+            digest = lfs_sha or self._download_sha256(path, revision)
+            if digest != artifact["sha256"]:
+                raise IOError(f"remote checksum mismatch for {path}")
 
     def _remote_lfs_matches(self, artifacts: list[dict[str, Any]]) -> set[str]:
         """Return content-verified LFS paths that need no repeat upload."""
@@ -247,6 +282,8 @@ class BackupManager:
         manifest: dict[str, Any] | None = None,
     ) -> BackupResult:
         try:
+            if date_str in self.confirmed_dates():
+                return BackupResult(date_str, True, "immutable receipt already exists")
             manifest = manifest or build_daily_manifest(self.data_dir, date_str, self.static_store)
             if not manifest["complete"]:
                 reason = "local date is incomplete: " + "; ".join(manifest["completeness_errors"])
@@ -267,7 +304,9 @@ class BackupManager:
                     path_in_repo=artifact["path"],
                     commit_message=f"Back up BKK collection date {date_str}",
                 )
-            self._verify_remote(artifacts)
+            revision = self.remote_revision()
+            self._verify_remote(artifacts, revision=revision)
+            self._validate_local(artifacts, verify_hashes=True)
             manifest_artifact = next(artifact for artifact in artifacts if artifact["kind"] == "daily_manifest")
             receipt = {
                 "version": 2,
@@ -275,7 +314,8 @@ class BackupManager:
                 "confirmed_at": utc_iso(),
                 "repo_id": self.repo_id,
                 "remote_verified": True,
-                "verification": "remote path and size; SHA-256 additionally checked for LFS objects",
+                "verification": "size and SHA-256 for every artifact at remote_revision (LFS hash or streamed download)",
+                "remote_revision": revision,
                 "manifest_sha256": manifest_artifact["sha256"],
                 "artifacts": artifacts,
             }
@@ -303,9 +343,11 @@ class BackupManager:
             self.logger.info("Backup verified for %s (%d artifacts)", date_str, len(artifacts))
             return BackupResult(date_str, True, "remote artifacts verified")
         except Exception as error:
-            reason = f"{type(error).__name__}: {error}"
+            reason = re.sub(r"https?://\S+", "<redacted-url>", f"{type(error).__name__}: {error}")
+            if self.token:
+                reason = reason.replace(self.token, "<redacted>")
             self._record_status(date_str, False, reason)
-            self.logger.exception("Backup failed for %s; it remains pending", date_str)
+            self.logger.error("Backup failed for %s; it remains pending: %s", date_str, reason)
             return BackupResult(date_str, False, reason)
 
     def _record_status(self, date_str: str, success: bool, reason: str) -> None:
@@ -371,59 +413,9 @@ class BackupManager:
         return build_daily_manifest(self.data_dir, date_str, self.static_store)
 
     def prune_confirmed_raw(self, after_days: int) -> list[Path]:
-        if after_days <= 0:
-            return []
-        cutoff = datetime.now(timezone.utc).date() - timedelta(days=after_days)
-        removed: list[Path] = []
-        for date_str in sorted(self.confirmed_dates()):
-            try:
-                date = datetime.strptime(date_str, "%Y-%m-%d").date()
-            except ValueError:
-                continue
-            if date >= cutoff:
-                continue
-            receipt_path = self.receipts_dir / f"date={date_str}.json"
-            receipt = read_json(receipt_path, {})
-            raw_artifacts = [artifact for artifact in receipt.get("artifacts", []) if artifact.get("kind") == "raw"]
-            if not raw_artifacts:
-                continue
-            safe = True
-            expected_paths = {artifact["path"] for artifact in raw_artifacts}
-            actual_paths = {
-                str(path.relative_to(self.data_dir))
-                for feed_name in FEED_NAMES
-                for path in (self.data_dir / "raw" / feed_name / f"date={date_str}").glob("*")
-                if path.is_file()
-            }
-            unexpected = actual_paths - expected_paths
-            if unexpected:
-                safe = False
-                self.logger.error("Refusing to prune %s; unexpected raw artifacts exist: %s", date_str, sorted(unexpected))
-            for artifact in raw_artifacts:
-                local = self.data_dir / artifact["path"]
-                if local.exists() and (local.stat().st_size != artifact["size"] or sha256_file(local) != artifact["sha256"]):
-                    safe = False
-                    self.logger.error("Refusing to prune changed raw artifact %s", local)
-            if not safe:
-                continue
-            prune_succeeded = True
-            pruned_any = False
-            for feed_name in FEED_NAMES:
-                directory = self.data_dir / "raw" / feed_name / f"date={date_str}"
-                if directory.exists():
-                    try:
-                        shutil.rmtree(directory)
-                    except OSError:
-                        prune_succeeded = False
-                        self.logger.exception("Could not finish pruning verified raw directory %s", directory)
-                    else:
-                        removed.append(directory)
-                        pruned_any = True
-            if prune_succeeded and pruned_any:
-                # Keep the remotely verified receipt immutable. Pruning is a
-                # separate local lifecycle event with its own append-only log.
-                append_jsonl(
-                    self.data_dir / "prune_history.jsonl",
-                    {"version": 1, "date": date_str, "pruned_at": utc_iso()},
-                )
-        return removed
+        from retention import prune_confirmed
+        return prune_confirmed(self, "raw", after_days)
+
+    def prune_confirmed_parquet(self, after_days: int) -> list[Path]:
+        from retention import prune_confirmed
+        return prune_confirmed(self, "parquet", after_days)
