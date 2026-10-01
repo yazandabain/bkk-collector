@@ -86,13 +86,39 @@ class FetchResult:
     error: str | None
 
 
+def _redact_text(message: str, api_key: str) -> str:
+    if api_key:
+        message = message.replace(api_key, "<redacted>")
+    return re.sub(r"([?&]key=)[^&\s]+", r"\1<redacted>", message, flags=re.IGNORECASE)
+
+
 def _redact_error(error: BaseException, api_key: str) -> str:
-    message = str(error).replace(api_key, "<redacted>") if api_key else str(error)
-    message = re.sub(r"([?&]key=)[^&\s]+", r"\1<redacted>", message, flags=re.IGNORECASE)
-    return f"{type(error).__name__}: {message}"[:1000]
+    return f"{type(error).__name__}: {_redact_text(str(error), api_key)}"[:1000]
+
+
+class _HttpLogRedaction(logging.Filter):
+    def __init__(self, api_key: str):
+        super().__init__()
+        self.api_key = api_key
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact_text(record.getMessage(), self.api_key)
+        record.args = ()
+        if record.exc_info:
+            record.exc_text = _redact_text(logging.Formatter().formatException(record.exc_info), self.api_key)
+            record.exc_info = None
+        if record.stack_info:
+            record.stack_info = _redact_text(record.stack_info, self.api_key)
+        return True
 
 
 def _new_session(config: CollectorConfig) -> requests.Session:
+    # Parent logger filters do NOT filter propagated child records. Install
+    # on the actual urllib3 emitters, including warnings and debug requests.
+    for name in ("urllib3.connectionpool", "urllib3.util.retry"):
+        logger = logging.getLogger(name)
+        if not any(isinstance(value, _HttpLogRedaction) and value.api_key == config.api_key for value in logger.filters):
+            logger.addFilter(_HttpLogRedaction(config.api_key))
     retry = Retry(
         total=config.http_connect_retries,
         connect=config.http_connect_retries,
