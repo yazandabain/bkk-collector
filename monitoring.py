@@ -213,6 +213,7 @@ class HealthMonitor:
         parquet_flush_errors: list[str],
         cycle_errors: list[str],
         scheduler: dict[str, dict[str, Any]] | None = None,
+        parquet_worker: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         reasons: list[str] = []
         warnings: list[str] = []
@@ -261,6 +262,11 @@ class HealthMonitor:
             reasons.append("parquet_flush_failed")
         if cycle_errors:
             reasons.append("cycle_storage_error")
+        if parquet_worker is not None:
+            if not parquet_worker.get("alive"):
+                reasons.append("parquet_worker_stopped")
+            if parquet_worker.get("active_seconds", 0) > 600:
+                reasons.append("parquet_worker_stuck")
         status = {
             "version": 1,
             "updated_at": utc_iso(now_ts),
@@ -274,6 +280,7 @@ class HealthMonitor:
             "disk_critical_bytes": disk_critical_bytes,
             "pending_spool_segments": pending_spool_segments,
             "parquet_flush_errors": parquet_flush_errors,
+            "parquet_worker": parquet_worker,
             "cycle_errors": cycle_errors,
             "scheduler": scheduler or {},
             "feeds": feed_status,

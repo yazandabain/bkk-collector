@@ -30,6 +30,7 @@ from config import CollectorConfig, FEED_NAMES, feed_urls
 from dedup import ChangeTracker, ChangeTrackerSignalError
 from gtfs_rt_parse import PARSERS, parse_feed
 from monitoring import HealthMonitor, append_poll_event, entity_timestamp_range, utc_iso
+from parquet_worker import ParquetCommitWorker
 from parquet_store import DurableParquetSpool
 from poll_journal import recent_partition_files, repair_jsonl_tail
 from raw_log import append_record, repair_truncated_tail
@@ -148,6 +149,7 @@ class Collector:
         self.sessions = {feed_name: _new_session(config) for feed_name in FEED_NAMES}
         self.executor = ThreadPoolExecutor(max_workers=len(FEED_NAMES), thread_name_prefix="bkk-fetch")
         self.spool = DurableParquetSpool(config.data_dir, config.parquet_flush_seconds)
+        self.commit_worker: ParquetCommitWorker | None = None
         self.monitor = HealthMonitor(
             config.data_dir,
             stale_seconds=config.feed_stale_seconds,
@@ -548,12 +550,11 @@ class Collector:
         cycle_errors: list[str],
         scheduler_snapshot: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Retry durable commits and atomically publish current collector health."""
-        flush = self.spool.flush()
-        for error in flush.errors:
-            self.logger.error("Parquet flush failed; durable spool retained for retry: %s", error)
-        if flush.files_written:
-            self.logger.info("Committed %d rows to %d Parquet file(s)", flush.rows_written, len(flush.files_written))
+        """Publish health without waiting for production Parquet commits."""
+        worker_status = self.commit_worker.snapshot() if self.commit_worker else None
+        # Only the offline one-shot helper uses synchronous commits. Production
+        # never calls flush/recovery here, even on startup or after a failure.
+        errors = worker_status["errors"] if worker_status else self.spool.flush().errors
         try:
             _total, _used, free = shutil.disk_usage(self.config.data_dir)
         except FileNotFoundError:
@@ -567,7 +568,8 @@ class Collector:
                 disk_warn_bytes=int(self.config.disk_warn_free_gb * 1_000_000_000),
                 disk_critical_bytes=int(self.config.disk_critical_free_gb * 1_000_000_000),
                 pending_spool_segments=len(self.spool.pending_segments()),
-                parquet_flush_errors=flush.errors,
+                parquet_flush_errors=errors,
+                parquet_worker=worker_status,
                 cycle_errors=cycle_errors,
                 scheduler=scheduler_snapshot,
             )
@@ -606,11 +608,8 @@ class Collector:
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         self.recover_recent_raw_tails()
         self.recover_recent_journal_tails()
-        recovered = self.spool.flush(force=True)
-        if recovered.errors:
-            self.logger.error("Startup spool recovery is pending: %s", "; ".join(recovered.errors))
-        elif recovered.files_written:
-            self.logger.info("Recovered %d staged rows from an earlier process", recovered.rows_written)
+        self.commit_worker = ParquetCommitWorker(self.spool, self.logger)
+        self.commit_worker.start()
         self.logger.info(
             "Starting realtime-only collector. data=%s intervals=%s trip_raw=%.1fs",
             self.config.data_dir,
@@ -622,61 +621,61 @@ class Collector:
             self.config.feed_intervals,
             executor=self.executor,
         )
-        self.scheduler.start()
         cycle_errors: list[str] = []
         last_status_monotonic = float("-inf")
-        while not _shutdown_requested:
-            item = self.scheduler.get(timeout=1.0)
-            if item is not None:
-                try:
-                    if item.worker_error is not None:
-                        cycle_errors.append(f"{item.feed_name}:unexpected_fetch_worker_failure")
-                        self.logger.error(
-                            "Unexpected fetch worker failure for %s: %s",
+        try:
+            self.scheduler.start()
+            while not _shutdown_requested:
+                item = self.scheduler.get(timeout=1.0)
+                if item is not None:
+                    try:
+                        if item.worker_error is not None:
+                            cycle_errors.append(f"{item.feed_name}:unexpected_fetch_worker_failure")
+                            self.logger.error(
+                                "Unexpected fetch worker failure for %s: %s",
+                                item.feed_name,
+                                _redact_error(item.worker_error, self.config.api_key),
+                            )
+                        else:
+                            self.process_result(item.value, cycle_errors, item)
+                    except Exception as error:
+                        cycle_errors.append(f"{item.feed_name}:unexpected_processing_failure")
+                        self.logger.exception(
+                            "Unexpected result-processing failure for %s: %s",
                             item.feed_name,
-                            _redact_error(item.worker_error, self.config.api_key),
+                            type(error).__name__,
                         )
-                    else:
-                        self.process_result(item.value, cycle_errors, item)
-                except Exception as error:
-                    cycle_errors.append(f"{item.feed_name}:unexpected_processing_failure")
-                    self.logger.exception(
-                        "Unexpected result-processing failure for %s: %s",
-                        item.feed_name,
-                        type(error).__name__,
-                    )
-                finally:
-                    self.scheduler.acknowledge(item)
+                    finally:
+                        self.scheduler.acknowledge(item)
 
-            now_monotonic = time.monotonic()
-            if item is not None or now_monotonic - last_status_monotonic >= 5.0:
-                poll_id = item.poll_id if item is not None else uuid.uuid4().hex
-                self._commit_and_write_status(poll_id, cycle_errors, self.scheduler.snapshot(now_monotonic))
-                cycle_errors = []
-                last_status_monotonic = now_monotonic
-
-        self.logger.info("Shutdown requested; stopping new requests and draining active requests.")
-        for item in self.scheduler.stop_and_drain():
-            if item.worker_error is not None:
-                cycle_errors.append(f"{item.feed_name}:unexpected_fetch_worker_failure")
-                self.logger.error(
-                    "Unexpected fetch worker failure during shutdown for %s: %s",
-                    item.feed_name,
-                    _redact_error(item.worker_error, self.config.api_key),
-                )
-                continue
+                now_monotonic = time.monotonic()
+                if item is not None or now_monotonic - last_status_monotonic >= 5.0:
+                    poll_id = item.poll_id if item is not None else uuid.uuid4().hex
+                    self._commit_and_write_status(poll_id, cycle_errors, self.scheduler.snapshot(now_monotonic))
+                    cycle_errors = []
+                    last_status_monotonic = now_monotonic
+        finally:
+            self.logger.info("Stopping new requests and draining active requests.")
             try:
-                self.process_result(item.value, cycle_errors, item)
-            except Exception:
-                cycle_errors.append(f"{item.feed_name}:unexpected_processing_failure")
-                self.logger.exception("Unexpected result-processing failure during shutdown for %s", item.feed_name)
-        self.logger.info("Committing all durable spool segments.")
-        result = self.spool.flush(force=True)
-        if result.errors:
-            self.logger.error("Parquet remains pending in durable spool: %s", "; ".join(result.errors))
-        for session in self.sessions.values():
-            session.close()
-        self.logger.info("Clean shutdown complete; no in-memory-only derived rows remain.")
+                for item in self.scheduler.stop_and_drain():
+                    if item.worker_error is not None:
+                        self.logger.error("Unexpected fetch worker failure during shutdown for %s: %s",
+                                          item.feed_name, _redact_error(item.worker_error, self.config.api_key))
+                        continue
+                    try:
+                        self.process_result(item.value, cycle_errors, item)
+                    except Exception:
+                        cycle_errors.append(f"{item.feed_name}:unexpected_processing_failure")
+                        self.logger.exception("Unexpected result-processing failure during shutdown for %s", item.feed_name)
+            finally:
+                # Durability ends at stage(), not at a successful Parquet flush.
+                # Even a fatal main-loop error must release the non-daemon
+                # scheduler, so Docker can restart instead of staying wedged.
+                if not self.commit_worker.stop():
+                    self.logger.warning("Commit worker still active; durable segments/markers will recover on restart")
+                for session in self.sessions.values():
+                    session.close()
+            self.logger.info("Shutdown drain finished; pending durable spool will recover on restart.")
 
 
 def main() -> None:

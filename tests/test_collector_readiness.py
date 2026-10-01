@@ -8,18 +8,21 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from google.transit import gtfs_realtime_pb2 as pb
 from urllib3.exceptions import NewConnectionError
+import collector as collector_module
 import rebuild_parquet
 from atomic_io import sha256_file
 from collector import Collector, FetchResult, _new_session
 from config import CollectorConfig, FEED_NAMES
 from gtfs_rt_parse import parse_trip_updates
 from monitoring import poll_journal_path, utc_iso
-from parquet_store import parquet_row_count, write_parquet_atomic
+from parquet_store import DurableParquetSpool, MAX_SEGMENTS_PER_COMMIT, parquet_row_count, write_parquet_atomic
+from parquet_worker import ParquetCommitWorker
 from poll_journal import append_poll_jsonl, recent_partition_files, repair_jsonl_tail
 from raw_log import append_record, scan_raw_log
+from realtime_scheduler import IndependentFeedScheduler
 
 
 def sample(feed_name: str, timestamp: int, sequences=(1, 2)) -> pb.FeedMessage:
@@ -82,6 +85,155 @@ class ReadinessFixture(unittest.TestCase):
     def rows(self, sequences=(1, 2)):
         return parse_trip_updates(sample("tripupdates", int(self.now), sequences), self.context("source"))
 
+
+
+
+class ParquetIsolationTests(ReadinessFixture):
+    def test_fatal_main_loop_error_stops_threads_and_drains_in_flight_results(self):
+        value = self.collector()
+        with patch.object(collector_module, "_shutdown_requested", False), \
+                patch.object(value, "fetch_feed", side_effect=lambda feed, poll:
+                             response(feed, sample(feed, int(self.now)), poll, self.now)), \
+                patch.object(value, "_commit_and_write_status", side_effect=OSError("status disk unavailable")):
+            with self.assertRaisesRegex(OSError, "status disk unavailable"):
+                value.run()
+        self.assertFalse(value.scheduler._thread.is_alive())
+        self.assertFalse(value.commit_worker.snapshot()["alive"])
+        for feed in FEED_NAMES:
+            self.assertEqual(1, len(poll_journal_path(self.data, feed, self.date).read_text().splitlines()))
+        recovered = DurableParquetSpool(self.data, flush_seconds=0).flush(force=True)
+        self.assertTrue(recovered.ok, recovered.errors)
+        self.assertEqual(4, sum(map(parquet_row_count, (self.data / "parquet").glob("*/date=*/*.parquet"))))
+
+    def test_zero_flush_interval_has_bounded_idle_wait(self):
+        spool = DurableParquetSpool(self.data, flush_seconds=0)
+        worker = ParquetCommitWorker(spool, logging.getLogger("test-parquet-idle"))
+        worker._stop = Mock()
+        worker._stop.is_set.side_effect = [False, True]
+        worker._run()
+        worker._stop.wait.assert_called_once_with(1.0)
+
+    def test_startup_and_ten_second_polls_continue_during_real_parquet_write(self):
+        value = self.collector()
+        old = value.spool.stage("vehiclepositions", self.date, "old", [{"entity_id": "old"}])
+        writing, release = threading.Event(), threading.Event()
+        real_write = write_parquet_atomic
+        writes = []
+
+        def gated_write(feed_name, rows, path):
+            if not writes:
+                writes.append(path)
+                writing.set()
+                if not release.wait(10):
+                    raise TimeoutError("test did not release Parquet writer")
+            return real_write(feed_name, rows, path)
+
+        start = time.monotonic()
+        clock = [start]
+        schedules = []
+
+        def scheduler_factory(fetch, intervals, **kwargs):
+            scheduler = IndependentFeedScheduler(fetch, intervals, **kwargs, monotonic=lambda: clock[0],
+                                                 wall_time=lambda: self.now + clock[0] - start)
+            schedules.append(scheduler)
+            return scheduler
+
+        def fetch(feed, poll):
+            return response(feed, sample(feed, int(self.now)), poll, self.now)
+
+        def processed(feed, count):
+            state = value.scheduler.snapshot(clock[0])[feed]
+            return state["total_completed"] >= count and not state["result_pending_processing"]
+
+        failures = []
+
+        def run():
+            try:
+                value.run()
+            except BaseException as error:
+                failures.append(error)
+
+        with patch.object(collector_module, "_shutdown_requested", False), \
+                patch("collector.IndependentFeedScheduler", side_effect=scheduler_factory), \
+                patch.object(value, "fetch_feed", side_effect=fetch), \
+                patch("parquet_store.write_parquet_atomic", side_effect=gated_write):
+            thread = threading.Thread(target=run, name="test-ingestion")
+            thread.start()
+            try:
+                self.assertTrue(writing.wait(3), "old spool must actually enter the writer")
+                wait_until(lambda: schedules and all(processed(feed, 1) for feed in FEED_NAMES))
+                for elapsed in (10, 20, 30):
+                    clock[0] = start + elapsed
+                    value.scheduler.step(clock[0])
+                    wait_until(lambda: all(processed(feed, elapsed // 10 + 1) for feed in FEED_NAMES[:2]))
+                wait_until(lambda: processed("alerts", 2))
+                state = value.scheduler.snapshot(clock[0])
+                self.assertEqual([4, 4, 2], [state[feed]["total_submitted"] for feed in FEED_NAMES])
+                self.assertEqual([0, 0, 0], [state[feed]["total_missed_deadlines"] for feed in FEED_NAMES])
+                self.assertTrue(old.exists(), "writer has not consumed its durable source")
+                self.assertFalse(release.is_set())
+                for feed in FEED_NAMES:
+                    events = [json.loads(line) for line in poll_journal_path(self.data, feed, self.date).read_text().splitlines()]
+                    self.assertEqual(4 if feed != "alerts" else 2, len(events))
+                    self.assertTrue(all(event["spool_ok"] for event in events))
+            finally:
+                collector_module._shutdown_requested = True
+                release.set()
+                thread.join(10)
+                if value.commit_worker:
+                    value.commit_worker.stop(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual([], failures)
+        self.assertTrue(writes[0].is_file())
+        self.assertGreaterEqual(parquet_row_count(writes[0]), 1)
+        self.assertEqual(2, value.config.prediction_time_change_threshold_seconds)
+        self.assertEqual({"vehiclepositions": 10., "tripupdates": 10., "alerts": 30.}, value.config.feed_intervals)
+
+    def test_failed_background_commit_keeps_segments_and_recovers_after_restart(self):
+        spool = DurableParquetSpool(self.data, flush_seconds=300)
+        source = spool.stage("alerts", self.date, "poll", [{"entity_id": "recover"}])
+        worker = ParquetCommitWorker(spool, logging.getLogger("test-parquet"))
+        with patch("parquet_store.write_parquet_atomic", side_effect=OSError("disk full")):
+            worker.start()
+            try:
+                wait_until(lambda: bool(worker.snapshot()["errors"]))
+                self.assertTrue(source.exists())
+                self.assertTrue(worker.snapshot()["alive"])
+            finally:
+                self.assertTrue(worker.stop(2))
+        restarted = DurableParquetSpool(self.data, flush_seconds=300)
+        result = restarted.flush(force=True)
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(1, sum(parquet_row_count(path) for path in result.files_written))
+        self.assertEqual([], restarted.pending_segments())
+
+    def test_shutdown_stops_between_batches_not_before_durable_publication(self):
+        spool = DurableParquetSpool(self.data, flush_seconds=0)
+        for index in range(MAX_SEGMENTS_PER_COMMIT + 1):
+            spool.stage("alerts", self.date, str(index), [{"entity_id": str(index)}])
+        checks = iter((False, True))
+        result = spool.flush(force=True, should_stop=lambda: next(checks))
+        self.assertEqual(MAX_SEGMENTS_PER_COMMIT, result.rows_written)
+        self.assertEqual(1, len(spool.pending_segments()))
+        restarted = DurableParquetSpool(self.data, flush_seconds=0)
+        remaining = restarted.flush(force=True)
+        self.assertEqual(1, remaining.rows_written)
+        files = list((self.data / "parquet" / "alerts" / f"date={self.date}").glob("*.parquet"))
+        self.assertEqual(MAX_SEGMENTS_PER_COMMIT + 1, sum(map(parquet_row_count, files)))
+
+    def test_worker_health_reports_failed_dead_and_stuck_writes(self):
+        value = self.collector()
+        for feed in FEED_NAMES:
+            value.process_result(response(feed, sample(feed, int(self.now)), feed, self.now), [])
+        for alive, duration, errors, reason in ((False, 0, [], "parquet_worker_stopped"),
+                                                (True, 601, [], "parquet_worker_stuck"),
+                                                (True, 0, ["failed write"], "parquet_flush_failed")):
+            with self.subTest(reason=reason):
+                worker = Mock(snapshot=lambda: {"alive": alive, "active_seconds": duration, "errors": errors})
+                value.commit_worker = worker
+                status = value._commit_and_write_status("status", [])
+                self.assertFalse(status["healthy"])
+                self.assertIn(reason, status["reasons"])
 
 
 
