@@ -8,14 +8,17 @@ import os
 import sys
 import time
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
 
 import realcity
-from config import FEED_NAMES, feed_urls
+from atomic_io import read_json
+from config import DEFAULT_FEED_INTERVALS, FEED_NAMES, feed_urls
 from gtfs_rt_parse import PARSERS, parse_feed
+from monitoring import data_poll_success, iter_jsonl, parse_iso_timestamp, poll_journal_path, utc_iso
 from quality_diagnostics import prediction_revision_report, tripupdate_static_join_report
 
 
@@ -201,6 +204,89 @@ def _percent(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.2%}"
 
 
+def collection_window_report(data_dir: Path, since: float, until: float) -> dict[str, Any]:
+    """Read persisted evidence without probing BKK or mutating collection state.
+
+    Count ratios are not time coverage: latency, restarts and UTC boundaries
+    can shift polls. Report response gaps and failures separately. Empty deltas
+    are successful presence observations, not missing derived predictions.
+    """
+    if not since < until:
+        raise ValueError("window start must precede its end")
+    first_date = datetime.fromtimestamp(since, timezone.utc).date()
+    last_date = datetime.fromtimestamp(until, timezone.utc).date()
+    status = read_json(data_dir / "health" / "status.json", {})
+    report = {"since": utc_iso(since), "until": utc_iso(until), "feeds": {},
+              "health": {key: status.get(key) for key in (
+                  "updated_at", "healthy", "reasons", "warnings", "disk_free_bytes",
+                  "pending_spool_segments", "parquet_worker")},
+              "note": "journal count ratios are not exact time coverage; scheduler misses are reported by subsequent requests"}
+    report["health"]["status_age_seconds"] = (
+        time.time() - status["updated_timestamp"] if status.get("updated_timestamp") is not None else None)
+    for feed_name in FEED_NAMES:
+        counts = Counter(dict.fromkeys(("journalled_polls", "successful_data_polls", "http_failures", "parse_failures",
+                                        "storage_tracking_evidence_failures", "scheduler_missed_deadlines_reported",
+                                        "raw_snapshots", "presence_confirmed_polls", "emitted_rows",
+                                        "failed_processing_polls_with_raw_evidence",
+                                        "freshness_incident_polls", "freshness_warning_polls",
+                                        "corrupt_lines_in_scanned_partitions"), 0))
+        dates = first_date
+        success_times, durations, cadences, run_ids = [], [], set(), set()
+        while dates <= last_date:
+            path = poll_journal_path(data_dir, feed_name, dates.isoformat())
+            if path.exists():
+                for _line, event in iter_jsonl(path):
+                    if event is None:
+                        counts["corrupt_lines_in_scanned_partitions"] += 1
+                        continue
+                    timestamp = parse_iso_timestamp(event.get("response_received_at"))
+                    if timestamp is None or not since <= timestamp < until:
+                        continue
+                    counts["journalled_polls"] += 1
+                    counts["scheduler_missed_deadlines_reported"] += int(event.get("missed_deadlines_before_request") or 0)
+                    success = bool(event.get("success"))
+                    parsed = success and bool(event.get("parse_ok"))
+                    stored = data_poll_success(event)
+                    counts["http_failures"] += not success
+                    counts["parse_failures"] += success and not parsed
+                    counts["storage_tracking_evidence_failures"] += parsed and not stored
+                    counts["successful_data_polls"] += stored
+                    counts["failed_processing_polls_with_raw_evidence"] += bool(
+                        not stored and event.get("raw_archived") and event.get("raw_ok", True))
+                    counts["raw_snapshots"] += bool(event.get("raw_archived"))
+                    counts["presence_confirmed_polls"] += event.get("presence_ok") is True
+                    counts["emitted_rows"] += int(event.get("emitted_rows") or 0)
+                    counts["freshness_incident_polls"] += any(not flag.endswith("_warning") for flag in event.get("freshness_flags", []))
+                    counts["freshness_warning_polls"] += any(flag.endswith("_warning") for flag in event.get("freshness_flags", []))
+                    if stored:
+                        success_times.append(timestamp)
+                    if event.get("processing_latency_ms") is not None:
+                        durations.append(float(event["processing_latency_ms"]))
+                    if event.get("poll_interval_seconds") is not None:
+                        cadences.add(float(event["poll_interval_seconds"]))
+                    if event.get("run_id"):
+                        run_ids.add(event["run_id"])
+            dates += timedelta(days=1)
+        cadence = next(iter(cadences)) if len(cadences) == 1 else DEFAULT_FEED_INTERVALS[feed_name]
+        expected = (until - since) / cadence
+        success_times.sort()
+        gaps = [current - previous for previous, current in zip(success_times, success_times[1:])]
+        durations.sort()
+        report["feeds"][feed_name] = {
+            **dict(counts), "configured_intervals_observed": sorted(cadences), "collector_run_ids": sorted(run_ids),
+            "expected_polls_approx": expected if len(cadences) <= 1 else None,
+            "successful_data_poll_count_ratio": counts["successful_data_polls"] / expected if len(cadences) <= 1 else None,
+            "max_successful_observation_gap_seconds": max(gaps, default=None),
+            "successful_observation_gaps_over_1_5_cadence": sum(gap > cadence * 1.5 for gap in gaps),
+            "start_boundary_without_success_seconds": success_times[0] - since if success_times else until - since,
+            "end_boundary_without_success_seconds": until - success_times[-1] if success_times else until - since,
+            "processing_ms_p95": durations[int((len(durations) - 1) * .95)] if durations else None,
+            "processing_ms_max": max(durations, default=None),
+            "scheduler_current_run": status.get("scheduler", {}).get(feed_name, {}),
+        }
+    return report
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -223,7 +309,23 @@ def main(argv: list[str] | None = None) -> int:
     static_join.add_argument("--warning-rate", type=float, default=0.90)
     static_join.add_argument("--max-snapshots", type=int)
     static_join.add_argument("--json", action="store_true")
+    window = subparsers.add_parser("collection-window", help="read-only JSON report of persisted polls, failures and gaps")
+    window.add_argument("--since", required=True, help="timezone-aware ISO timestamp, e.g. 2026-10-01T10:00:00Z")
+    window.add_argument("--until", help="timezone-aware ISO timestamp; default: now")
+    window.add_argument("--data-dir", default=os.environ.get("DATA_DIR", "/data"))
     args = parser.parse_args(argv)
+    if args.command == "collection-window":
+        try:
+            values = [datetime.fromisoformat(value.replace("Z", "+00:00"))
+                      for value in (args.since, args.until or utc_iso())]
+            if any(value.tzinfo is None for value in values):
+                raise ValueError("window timestamps must include a timezone")
+            report = collection_window_report(Path(args.data_dir), *(value.timestamp() for value in values))
+        except Exception as error:
+            print(f"collection window diagnostic failed: {type(error).__name__}", file=sys.stderr)
+            return 1
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
     if args.command == "live-schema":
         api_key = os.environ.get("BKK_API_KEY", "").strip()
         if not api_key:

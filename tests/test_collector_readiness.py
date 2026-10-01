@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import io
 import json
 import logging
@@ -9,21 +10,24 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
+
 from google.transit import gtfs_realtime_pb2 as pb
 from urllib3.exceptions import NewConnectionError
+
 import collector as collector_module
 import rebuild_parquet
 from atomic_io import atomic_write_json, read_json, sha256_file
 from backup import BackupManager
 from collector import Collector, FetchResult, _new_session
 from config import CollectorConfig, FEED_NAMES
+from diagnostics import collection_window_report, main as diagnostics_main
 from gtfs_rt_parse import parse_trip_updates
-from manifests import _presence_stats, build_daily_manifest
-from monitoring import poll_journal_path, utc_iso
+from manifests import _feed_stats, _presence_stats, build_daily_manifest
+from monitoring import HealthMonitor, append_poll_event, poll_journal_path, utc_iso
 from parquet_store import DurableParquetSpool, MAX_SEGMENTS_PER_COMMIT, parquet_row_count, write_parquet_atomic
 from parquet_worker import ParquetCommitWorker
 from poll_journal import append_poll_jsonl, recent_partition_files, repair_jsonl_tail
-from raw_log import append_record, scan_raw_log
+from raw_log import append_record, iter_records, scan_raw_log
 from realtime_scheduler import IndependentFeedScheduler
 from static_gtfs import StaticGtfsStore
 from tests.test_reliability import FakeBackupApi, StaticSession, gtfs_zip_bytes
@@ -50,13 +54,11 @@ def sample(feed_name: str, timestamp: int, sequences=(1, 2)) -> pb.FeedMessage:
     return feed
 
 
-
 def response(feed_name: str, feed: pb.FeedMessage | None, poll_id: str, timestamp: float) -> FetchResult:
     return FetchResult(feed_name, poll_id, utc_iso(timestamp - .01), timestamp - .01,
                        utc_iso(timestamp), timestamp, 10.0, 200 if feed is not None else None,
                        feed.SerializeToString() if feed is not None else None,
                        None if feed is not None else "ConnectionError: unavailable")
-
 
 
 def wait_until(predicate, timeout=5.0):
@@ -66,7 +68,6 @@ def wait_until(predicate, timeout=5.0):
             return
         threading.Event().wait(.01)
     raise AssertionError("condition was not satisfied before timeout")
-
 
 
 class ReadinessFixture(unittest.TestCase):
@@ -93,7 +94,6 @@ class ReadinessFixture(unittest.TestCase):
 
     def records(self, date=None):
         return [record for _timestamp, record in iter_presence(presence_path(self.data, date or self.date))]
-
 
 
 class ParquetIsolationTests(ReadinessFixture):
@@ -245,7 +245,6 @@ class ParquetIsolationTests(ReadinessFixture):
                 self.assertIn(reason, status["reasons"])
 
 
-
 class PresenceTests(ReadinessFixture):
     def test_withdrawal_and_reappearance_survive_even_when_prediction_rows_are_suppressed(self):
         value = self.collector()
@@ -327,6 +326,8 @@ class PresenceTests(ReadinessFixture):
         self.assertFalse(events[-1]["presence_ok"])
         self.assertTrue(events[-1]["raw_archived"])
         self.assertEqual(300, events[-1]["raw_archive_interval_seconds"])
+        stats, _errors, _quality = _feed_stats(self.data, "tripupdates", self.date, create_empty=False)
+        self.assertEqual(1, stats["failed_processing_polls_with_raw_evidence"])
         value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), "third", self.now + 20), [])
         self.assertEqual("presence_write_gap", self.records()[-1]["baseline_reason"])
 
@@ -385,7 +386,6 @@ class PresenceTests(ReadinessFixture):
         self.assertEqual([], errors)
         self.assertEqual(1, stats["legacy_pre_presence_polls"])
         self.assertTrue(any("mixed-version" in flag for flag in quality))
-
 
 
 class JournalRecoveryTests(ReadinessFixture):
@@ -467,7 +467,6 @@ class JournalRecoveryTests(ReadinessFixture):
         self.assertEqual([], recent_partition_files(self.data / "missing", "polls.jsonl", self.date))
 
 
-
 class RetryRedactionTests(ReadinessFixture):
     def test_actual_urllib3_connection_retry_warning_does_not_leak_key(self):
         canary = "not-a-real-BKK-key-CANARY"
@@ -503,7 +502,6 @@ class RetryRedactionTests(ReadinessFixture):
                 logger.exception("failed request")
         self.assertNotIn(canary, "\n".join(captured.output))
         self.assertIn("<redacted>", "\n".join(captured.output))
-
 
 
 class RebuildSafetyTests(ReadinessFixture):
@@ -570,7 +568,6 @@ class RebuildSafetyTests(ReadinessFixture):
             self.assertEqual(self.date, run.call_args.args[1])
 
 
-
 class CoverageAndRestoreTests(ReadinessFixture):
     def test_new_presence_and_run_metadata_are_in_verified_backup_receipt(self):
         self.date = "2026-09-24"
@@ -607,6 +604,73 @@ class CoverageAndRestoreTests(ReadinessFixture):
         with self.assertRaisesRegex(ValueError, "presence evidence"):
             BackupManager._validate_manifest(self.date, missing_presence)
 
+    def test_collection_window_reads_across_midnight_and_separates_failures(self):
+        midnight = datetime(2026, 9, 25, tzinfo=timezone.utc).timestamp()
+        for index, (success, parse_ok, spool_ok) in enumerate(((True, True, True), (False, False, False),
+                                                              (True, False, False), (True, True, False),
+                                                              (True, True, True))):
+            timestamp = midnight - 10 + index * 10
+            date = utc_iso(timestamp)[:10]
+            append_poll_event(self.data, "vehiclepositions", date, {
+                "poll_id": str(index), "response_received_at": utc_iso(timestamp),
+                "poll_interval_seconds": 10, "success": success, "parse_ok": parse_ok, "spool_ok": spool_ok,
+                "missed_deadlines_before_request": 2 if index == 4 else 0, "processing_latency_ms": index,
+            })
+        before = {str(path.relative_to(self.data)): sha256_file(path) for path in self.data.rglob("*") if path.is_file()}
+        with patch("requests.Session.get", side_effect=AssertionError("offline diagnostic must not contact BKK")):
+            report = collection_window_report(self.data, midnight - 10, midnight + 40)
+        stats = report["feeds"]["vehiclepositions"]
+        self.assertEqual((5, 2, 1, 1, 1), tuple(stats[key] for key in (
+            "journalled_polls", "successful_data_polls", "http_failures", "parse_failures", "storage_tracking_evidence_failures")))
+        self.assertEqual(2, stats["scheduler_missed_deadlines_reported"])
+        self.assertEqual(40, stats["max_successful_observation_gap_seconds"])
+        self.assertEqual(.4, stats["successful_data_poll_count_ratio"])
+        self.assertEqual(0, report["feeds"]["tripupdates"]["journalled_polls"])
+        self.assertEqual(before, {str(path.relative_to(self.data)): sha256_file(path) for path in self.data.rglob("*") if path.is_file()})
+
+    def test_collection_window_requires_explicit_timezone(self):
+        with patch("sys.stderr", io.StringIO()):
+            self.assertEqual(1, diagnostics_main(["collection-window", "--since", "2026-09-24T08:00:00",
+                                                 "--data-dir", str(self.data)]))
+
+    def test_small_poll_loss_is_visible_without_inventing_http_failures(self):
+        date = "2026-09-24"
+        start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+        # An otherwise successful day missing just one internal deadline.
+        events = []
+        for index in range(2880):
+            if index == 100:
+                continue
+            events.append({
+                "poll_id": str(index), "success": True, "parse_ok": True,
+                "poll_interval_seconds": 30, "response_received_at": utc_iso(start + index * 30),
+                "missed_deadlines_before_request": 1 if index == 101 else 0,
+            })
+        path = poll_journal_path(self.data, "alerts", date)
+        path.parent.mkdir(parents=True)
+        path.write_text("".join(json.dumps(event) + "\n" for event in events))
+        stats, _errors, quality = _feed_stats(self.data, "alerts", date, create_empty=False)
+        self.assertEqual(0, stats["failed_http_polls"])
+        self.assertEqual(1, stats["poll_count_shortfall"])
+        self.assertEqual(1, stats["scheduler_missed_deadlines"])
+        self.assertEqual(1, stats["successful_observation_gap_count"])
+        self.assertEqual(60, stats["max_successful_observation_gap_seconds"])
+        self.assertAlmostEqual(2879 / 2880, stats["successful_data_poll_count_ratio"])
+        self.assertTrue(any("scheduler deadlines missed" in reason for reason in quality))
+
+    def test_storage_failure_is_not_reported_as_successful_data_coverage(self):
+        date = "2026-09-24"
+        for index, stored in enumerate((True, False, True)):
+            append_poll_event(self.data, "vehiclepositions", date, {
+                "success": True, "parse_ok": True, "spool_ok": stored, "poll_id": str(index),
+                "poll_interval_seconds": 10, "response_received_at": f"{date}T00:00:{index * 10:02d}+00:00",
+            })
+        stats, _errors, quality = _feed_stats(self.data, "vehiclepositions", date, create_empty=False)
+        self.assertEqual(3, stats["successful_parse_polls"])
+        self.assertEqual(2, stats["successful_data_polls"])
+        self.assertEqual(0, stats["failed_http_polls"])
+        self.assertEqual(20, stats["max_successful_observation_gap_seconds"])
+        self.assertTrue(any("storage/tracking/evidence failures" in flag for flag in quality))
 
     def test_restore_samples_new_evidence_and_journal_not_just_checkpoints(self):
         date = "2026-09-24"
@@ -632,7 +696,6 @@ class CoverageAndRestoreTests(ReadinessFixture):
         self.assertIn(names["poll_metadata"], restored)
         self.assertFalse(any(path.endswith(".checkpoint.json") for path in restored))
         self.assertTrue(result["temporary_directory_removed"])
-
 
 
 if __name__ == "__main__":

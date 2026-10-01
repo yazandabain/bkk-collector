@@ -253,7 +253,8 @@ class HealthMonitor:
                 ):
                     reasons.append(f"{feed_name}:request_stuck")
                 missed = int(schedule.get("missed_since_last_request") or 0)
-                if missed:
+                recent_miss_age = schedule.get("seconds_since_missed_deadline")
+                if missed or (recent_miss_age is not None and recent_miss_age < 300):
                     warnings.append(f"{feed_name}:scheduler_missed_deadline")
                 next_due = schedule.get("next_deadline_in_seconds")
                 if next_due is not None and interval and float(next_due) < -interval:

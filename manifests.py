@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any
 
 from atomic_io import atomic_write_json, sha256_file
 from config import DEFAULT_FEED_INTERVALS, FEED_NAMES, MIN_REALTIME_INTERVAL_SECONDS
-from monitoring import iter_jsonl, poll_journal_path, utc_iso
+from monitoring import data_poll_success, iter_jsonl, parse_iso_timestamp, poll_journal_path, utc_iso
 from parquet_store import ensure_empty_parquet, parquet_row_count
 from raw_log import scan_raw_log
 from static_gtfs import StaticGtfsStore
@@ -26,6 +27,24 @@ def _artifact(data_dir: Path, path: Path, kind: str) -> dict[str, Any]:
         "size": path.stat().st_size,
         "mtime_ns": path.stat().st_mtime_ns,
         "sha256": sha256_file(path),
+    }
+
+
+def _observation_gaps(events: list[dict], date: str, interval: float) -> dict:
+    start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+    times = sorted(timestamp for event in events
+                   if (timestamp := parse_iso_timestamp(event.get("response_received_at"))) is not None
+                   and start <= timestamp < start + 86400)
+    gaps = [(previous, current) for previous, current in zip(times, times[1:])
+            if current - previous > interval * 1.5]
+    return {
+        "successful_observation_gap_count": len(gaps),
+        "max_successful_observation_gap_seconds": max((b - a for a, b in zip(times, times[1:])), default=None),
+        "start_boundary_without_success_seconds": times[0] - start if times else 86400,
+        "end_boundary_without_success_seconds": start + 86400 - times[-1] if times else 86400,
+        "gap_samples": [{"previous_response_at": utc_iso(a), "next_response_at": utc_iso(b),
+                         "seconds": round(b - a, 6)} for a, b in gaps[:20]],
+        "gap_interpretation": "response intervals, not inferred exact lost-poll counts; HTTP/parse/storage failures and scheduler misses are separate",
     }
 
 
@@ -78,7 +97,6 @@ def _presence_stats(data_dir: Path, date: str, events: list[dict]) -> tuple[dict
             "unavailable_observations": unavailable}, errors, quality
 
 
-
 def _feed_stats(data_dir: Path, feed_name: str, date_str: str, *, create_empty: bool) -> tuple[dict[str, Any], list[str], list[str]]:
     errors: list[str] = []
     quality_flags: list[str] = []
@@ -118,7 +136,7 @@ def _feed_stats(data_dir: Path, feed_name: str, date_str: str, *, create_empty: 
             interval = float(event.get("poll_interval_seconds"))
         except (TypeError, ValueError):
             continue
-        if interval >= MIN_REALTIME_INTERVAL_SECONDS:
+        if math.isfinite(interval) and interval >= MIN_REALTIME_INTERVAL_SECONDS:
             observed_intervals.append(interval)
     observed_intervals.sort()
     # Journals are per-feed. Use that feed's observed median cadence (robust to
@@ -130,14 +148,30 @@ def _feed_stats(data_dir: Path, feed_name: str, date_str: str, *, create_empty: 
         else DEFAULT_FEED_INTERVALS[feed_name]
     )
     expected_polls = max(1, round(86400 / expected_interval))
-    if attempted < expected_polls * 0.9:
+    # One edge poll can legitimately straddle a UTC boundary. Never hide
+    # sustained losses merely because more than 90% of attempts survived.
+    if attempted < expected_polls - 1:
         quality_flags.append(f"{feed_name}: only {attempted}/{expected_polls} expected polls recorded")
+    scheduler_misses = sum(int(event.get("missed_deadlines_before_request") or 0) for event in events)
+    if scheduler_misses:
+        quality_flags.append(f"{feed_name}: {scheduler_misses} scheduler deadlines missed")
+    if len(set(observed_intervals)) > 1:
+        quality_flags.append(f"{feed_name}: cadence changed; daily expected count uses the observed median")
+    recovered_tails = list(journal.parent.glob("polls.jsonl.corrupt-tail-*"))
+    if recovered_tails:
+        quality_flags.append(f"{feed_name}: recovered poll journal tail; one or more events may be missing")
     failed_responses = attempted - len(responses)
     if failed_responses:
         quality_flags.append(f"{feed_name}: {failed_responses} failed poll(s)")
     parse_failures = len(responses) - len(parse_successes)
     if parse_failures:
         quality_flags.append(f"{feed_name}: {parse_failures} parse failure(s)")
+    data_successes = [event for event in responses if data_poll_success(event)]
+    if len(data_successes) < len(parse_successes):
+        quality_flags.append(f"{feed_name}: {len(parse_successes) - len(data_successes)} parsed poll(s) had storage/tracking/evidence failures")
+    gap_stats = _observation_gaps(data_successes, date_str, expected_interval)
+    failed_processing_with_raw = sum(bool(event.get("raw_archived") and event.get("raw_ok", True)
+                                          and not data_poll_success(event)) for event in responses)
     stale_incidents = sum(1 for event in responses if any(
         not flag.endswith("_warning") for flag in event.get("freshness_flags", [])
     ))
@@ -207,6 +241,12 @@ def _feed_stats(data_dir: Path, feed_name: str, date_str: str, *, create_empty: 
         "failed_http_polls": failed_responses,
         "successful_parse_polls": len(parse_successes),
         "parse_failures": parse_failures,
+        "successful_data_polls": len(data_successes),
+        "failed_processing_polls_with_raw_evidence": failed_processing_with_raw,
+        "journalled_poll_count_ratio": attempted / expected_polls,
+        "successful_data_poll_count_ratio": len(data_successes) / expected_polls,
+        "poll_count_shortfall": max(0, expected_polls - attempted),
+        **gap_stats,
         "first_success_at": min(timestamps) if timestamps else None,
         "last_success_at": max(timestamps) if timestamps else None,
         "raw_snapshots": raw_records,
@@ -221,11 +261,10 @@ def _feed_stats(data_dir: Path, feed_name: str, date_str: str, *, create_empty: 
         "stale_feed_polls": stale_incidents,
         "freshness_warning_polls": freshness_warning_polls,
         "corrupt_journal_lines": corrupt_journal_lines,
+        "recovered_journal_tail_files": len(recovered_tails),
         "collector_run_ids": sorted({event["run_id"] for event in events if event.get("run_id")}),
         "pending_spool_segments": len(pending_spool),
-        "scheduler_missed_deadlines": sum(
-            int(event.get("missed_deadlines_before_request") or 0) for event in events
-        ),
+        "scheduler_missed_deadlines": scheduler_misses,
     }
     if feed_name == "tripupdates":
         presence, presence_errors, presence_quality = _presence_stats(data_dir, date_str, events)
