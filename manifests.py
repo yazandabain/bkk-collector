@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from monitoring import iter_jsonl, poll_journal_path, utc_iso
 from parquet_store import ensure_empty_parquet, parquet_row_count
 from raw_log import scan_raw_log
 from static_gtfs import StaticGtfsStore
+from tripupdate_presence import apply_presence_record, iter_presence, presence_path
 
 
 def _artifact(data_dir: Path, path: Path, kind: str) -> dict[str, Any]:
@@ -25,6 +27,56 @@ def _artifact(data_dir: Path, path: Path, kind: str) -> dict[str, Any]:
         "mtime_ns": path.stat().st_mtime_ns,
         "sha256": sha256_file(path),
     }
+
+
+def _presence_stats(data_dir: Path, date: str, events: list[dict]) -> tuple[dict, list[str], list[str]]:
+    promised = {event["poll_id"]: event for event in events
+                if event.get("presence_required") and event.get("presence_ok") is True}
+    expected = sum(bool(event.get("presence_required") and event.get("parse_ok")) for event in events)
+    path = presence_path(data_dir, date)
+    errors, quality = [], []
+    count, baselines = 0, 0
+    seen: dict[str, tuple[str, int]] = {}
+    members = {}
+    stream = None
+    sequence = 0
+    if path.exists():
+        try:
+            if not scan_raw_log(path).clean:
+                raise ValueError("presence log has an invalid/truncated tail")
+            for _timestamp, record in iter_presence(path):
+                if record["kind"] == "baseline":
+                    if record["sequence"] != 1:
+                        raise ValueError("presence baseline sequence is invalid")
+                    stream, sequence = record["stream_id"], 0
+                    baselines += 1
+                if record["stream_id"] != stream or record["sequence"] != sequence + 1:
+                    raise ValueError("presence stream has a sequence gap")
+                members = apply_presence_record(members, record)
+                sequence = record["sequence"]
+                poll_id = record["poll_id"]
+                if poll_id in seen:
+                    raise ValueError("duplicate presence poll ID")
+                seen[poll_id] = (stream, sequence)
+                count += 1
+        except Exception as error:
+            errors.append(f"tripupdates_presence: {type(error).__name__}: {error}")
+    if any(seen.get(poll_id) != (event.get("presence_stream_id"), event.get("presence_sequence"))
+           for poll_id, event in promised.items()):
+        errors.append("tripupdates_presence: journal-promised membership evidence is missing/mismatched")
+    unavailable = expected - len(promised)
+    if unavailable:
+        quality.append(f"tripupdates_presence: {unavailable} parsed poll(s) lacked confirmed membership evidence; consult forced raw fallback")
+    if list(path.parent.glob("presence.jsonlog.corrupt-tail-*")):
+        quality.append("tripupdates_presence: recovered tail; membership observations may be missing")
+    legacy_polls = sum(bool(event.get("parse_ok") and not event.get("presence_required")) for event in events)
+    if expected and legacy_polls:
+        quality.append(f"tripupdates_presence: mixed-version date; {legacy_polls} legacy parsed poll(s) have no membership evidence")
+    return {"expected_observations": expected, "journal_confirmed_observations": len(promised),
+            "records": count, "baselines": baselines,
+            "legacy_pre_presence_polls": legacy_polls,
+            "unavailable_observations": unavailable}, errors, quality
+
 
 
 def _feed_stats(data_dir: Path, feed_name: str, date_str: str, *, create_empty: bool) -> tuple[dict[str, Any], list[str], list[str]]:
@@ -169,11 +221,17 @@ def _feed_stats(data_dir: Path, feed_name: str, date_str: str, *, create_empty: 
         "stale_feed_polls": stale_incidents,
         "freshness_warning_polls": freshness_warning_polls,
         "corrupt_journal_lines": corrupt_journal_lines,
+        "collector_run_ids": sorted({event["run_id"] for event in events if event.get("run_id")}),
         "pending_spool_segments": len(pending_spool),
         "scheduler_missed_deadlines": sum(
             int(event.get("missed_deadlines_before_request") or 0) for event in events
         ),
     }
+    if feed_name == "tripupdates":
+        presence, presence_errors, presence_quality = _presence_stats(data_dir, date_str, events)
+        stats["presence"] = presence
+        errors.extend(presence_errors)
+        quality_flags.extend(presence_quality)
     return stats, errors, quality_flags
 
 
@@ -230,6 +288,19 @@ def build_daily_manifest(
         for path in sorted(journal.parent.glob(journal.name + "*")):
             if path.is_file():
                 artifacts.append(_artifact(data_dir, path, "poll_metadata"))
+    for path in sorted(presence_path(data_dir, date_str).parent.glob("*")):
+        if path.is_file():
+            artifacts.append(_artifact(data_dir, path, "tripupdates_presence"))
+    run_ids = {run_id for stats in feeds.values() for run_id in stats["collector_run_ids"]}
+    for run_id in sorted(run_ids):
+        if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+            errors.append("collector_runs: invalid run ID in poll journal")
+            continue
+        path = data_dir / "metadata" / "collector_runs" / f"{run_id}.json"
+        if not path.is_file():
+            errors.append(f"collector_runs: missing run provenance {run_id}")
+        else:
+            artifacts.append(_artifact(data_dir, path, "collector_run_metadata"))
     if applicable_static is not None:
         # Include every distinct static version known locally, not just today's
         # applicable one. This also brings preserved v1-era static archives into

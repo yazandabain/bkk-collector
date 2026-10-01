@@ -173,6 +173,11 @@ class BackupManager:
                 raise ValueError(f"daily manifest lacks required {feed_name} raw/poll artifacts")
             if not any(path and path.startswith(parquet_prefix) and path.endswith(".parquet") for path in artifact_paths):
                 raise ValueError(f"daily manifest lacks required {feed_name} Parquet artifact")
+            if feed_name == "tripupdates" and stats.get("presence", {}).get("journal_confirmed_observations", 0):
+                presence = stats["presence"]
+                if (presence.get("records", 0) < presence["journal_confirmed_observations"]
+                        or f"metadata/tripupdates_presence/date={date_str}/presence.jsonlog" not in artifact_paths):
+                    raise ValueError("daily manifest lacks promised TripUpdates presence evidence")
         version_path = static.get("version_path")
         if not isinstance(version_path, str) or f"static_gtfs/{version_path}" not in artifact_paths:
             raise ValueError("daily manifest lacks its applicable static GTFS archive")

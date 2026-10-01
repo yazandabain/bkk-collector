@@ -104,6 +104,8 @@ class HealthMonitor:
         min_entity_timestamp: int | None,
         max_entity_timestamp: int | None,
         parse_ok: bool,
+        presence_ok: bool = True,
+        presence_details: dict[str, Any] | None = None,
         change_tracking_ok: bool = True,
         change_tracking_failure_flag: str | None = None,
         raw_ok: bool,
@@ -162,6 +164,8 @@ class HealthMonitor:
             flags.append("raw_archive_failed")
         if not spool_ok:
             flags.append("derived_spool_failed")
+        if not presence_ok:
+            flags.append("tripupdates_presence_failed")
         state.update(
             {
                 "last_success_at": utc_iso(now_ts),
@@ -180,6 +184,8 @@ class HealthMonitor:
                 "entity_count": entity_count,
                 "consecutive_failures": 0,
                 "parse_ok": parse_ok,
+                "presence_ok": presence_ok,
+                "presence": presence_details or {},
                 "change_tracking_ok": change_tracking_ok,
                 "change_tracking_failure_flag": change_tracking_failure_flag,
                 "raw_ok": raw_ok,
@@ -291,6 +297,13 @@ class HealthMonitor:
 
 def poll_journal_path(data_dir: Path, feed_name: str, date_str: str) -> Path:
     return data_dir / "metadata" / "polls" / feed_name / f"date={date_str}" / "polls.jsonl"
+
+
+def data_poll_success(event: dict[str, Any]) -> bool:
+    """All normal-path evidence succeeded; raw fallback is counted separately."""
+    return bool(event.get("success") and event.get("parse_ok") and all(
+        event.get(field, True) is not False for field in ("raw_ok", "spool_ok", "change_tracking_ok")
+    ) and (not event.get("presence_required") or event.get("presence_ok") is True))
 
 
 def append_poll_event(data_dir: Path, feed_name: str, date_str: str, event: dict[str, Any]) -> None:

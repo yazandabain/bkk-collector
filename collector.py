@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import logging.handlers
+import os
 import re
 import shutil
 import signal
@@ -30,11 +31,13 @@ from config import CollectorConfig, FEED_NAMES, feed_urls
 from dedup import ChangeTracker, ChangeTrackerSignalError
 from gtfs_rt_parse import PARSERS, parse_feed
 from monitoring import HealthMonitor, append_poll_event, entity_timestamp_range, utc_iso
+from atomic_io import atomic_write_json
 from parquet_worker import ParquetCommitWorker
 from parquet_store import DurableParquetSpool
 from poll_journal import recent_partition_files, repair_jsonl_tail
 from raw_log import append_record, repair_truncated_tail
 from realtime_scheduler import IndependentFeedScheduler, ScheduledResult
+from tripupdate_presence import TripUpdatePresence
 from trip_update_policy import (
     TRIP_UPDATE_DELAY_FIELDS,
     TRIP_UPDATE_EXACT_MUTABLE_FIELDS,
@@ -150,6 +153,9 @@ class Collector:
         self.executor = ThreadPoolExecutor(max_workers=len(FEED_NAMES), thread_name_prefix="bkk-fetch")
         self.spool = DurableParquetSpool(config.data_dir, config.parquet_flush_seconds)
         self.commit_worker: ParquetCommitWorker | None = None
+        self.run_id = uuid.uuid4().hex
+        self._run_metadata_written = False
+        self.presence = TripUpdatePresence(config.data_dir, self.run_id)
         self.monitor = HealthMonitor(
             config.data_dir,
             stale_seconds=config.feed_stale_seconds,
@@ -247,6 +253,30 @@ class Collector:
                         self.logger.error("Preserved torn poll journal tail: %s", recovery)
                 except Exception:
                     self.logger.exception("CRITICAL: poll journal tail remains unsafe: %s", path)
+        root = self.config.data_dir / "metadata" / "tripupdates_presence"
+        for path in recent_partition_files(root, "presence.jsonlog", today):
+            try:
+                recovery = repair_truncated_tail(path)
+                if recovery:
+                    self.logger.error("Preserved torn TripUpdates presence tail: %s", recovery)
+            except Exception:
+                self.logger.exception("CRITICAL: presence journal tail remains unsafe: %s", path)
+
+    def _write_run_metadata(self) -> None:
+        if self._run_metadata_written:
+            return
+        config = self.config
+        atomic_write_json(self.config.data_dir / "metadata" / "collector_runs" / f"{self.run_id}.json", {
+            "version": 1, "run_id": self.run_id, "started_at": utc_iso(),
+            "collector_git_commit": os.environ.get("COLLECTOR_GIT_COMMIT", "unknown"),
+            "schema_version": 2, "presence_version": 1,
+            "poll_intervals_seconds": config.feed_intervals,
+            "raw_archive_intervals_seconds": config.raw_archive_intervals,
+            "numeric_tolerances": config.trip_update_numeric_tolerances,
+            "heartbeat_seconds": config.heartbeat_seconds, "raw_fsync": config.raw_fsync,
+            "change_tracker_null_guard_rows": config.change_tracker_null_guard_rows,
+        })
+        self._run_metadata_written = True
 
     def fetch_feed(self, feed_name: str, poll_id: str) -> FetchResult:
         started_ts = time.time()
@@ -343,7 +373,10 @@ class Collector:
         return {
             "version": 1,
             "poll_id": result.poll_id,
+            "run_id": self.run_id,
             "feed": result.feed_name,
+            "presence_required": result.feed_name == "tripupdates",
+            "presence_ok": False if result.feed_name == "tripupdates" else None,
             "poll_interval_seconds": self.config.feed_intervals[result.feed_name],
             **self._schedule_event_fields(schedule),
             "request_started_at": result.request_started_at,
@@ -368,8 +401,17 @@ class Collector:
         cycle_errors: list[str],
         schedule: ScheduledResult | None = None,
     ) -> None:
+        processing_started = time.monotonic()
+        queue_latency_ms = max(0.0, time.time() - result.response_received_ts) * 1000
+        try:
+            self._write_run_metadata()
+        except Exception:
+            cycle_errors.append("run_metadata_write_failed")
+            self.logger.exception("CRITICAL: could not persist non-secret run provenance")
         date_str = datetime.fromtimestamp(result.response_received_ts, tz=timezone.utc).strftime("%Y-%m-%d")
         if result.payload is None:
+            if result.feed_name == "tripupdates":
+                self.presence.invalidate("http_observation_gap")
             self.logger.warning("Fetch failed for %s: %s", result.feed_name, result.error)
             self.monitor.record_failure(
                 result.feed_name,
@@ -402,8 +444,14 @@ class Collector:
         change_tracking_failure_flag: str | None = None
         spool_error: str | None = None
         tracker = None
+        presence_ok = True
+        presence_details: dict[str, Any] = {}
+        presence_error = None
         try:
             feed = parse_feed(result.payload)
+            expected_entity = {"vehiclepositions": "vehicle", "tripupdates": "trip_update", "alerts": "alert"}[result.feed_name]
+            if any(not entity.HasField(expected_entity) and not entity.is_deleted for entity in feed.entity):
+                raise ValueError(f"{result.feed_name} response contains an unexpected entity type")
             content_digest = hashlib.sha256()
             for serialized_entity in sorted(entity.SerializeToString() for entity in feed.entity):
                 content_digest.update(len(serialized_entity).to_bytes(8, "big"))
@@ -419,6 +467,21 @@ class Collector:
         except Exception as error:
             parse_error = _redact_error(error, self.config.api_key)
             self.logger.exception("Failed parsing %s; preserving a raw fallback", result.feed_name)
+
+        if result.feed_name == "tripupdates":
+            if parse_ok:
+                try:
+                    presence_details = self.presence.observe(parsed_rows, date_str, result.response_received_ts, {
+                        **context, "feed_header_timestamp": feed.header.timestamp if feed.header.HasField("timestamp") else None,
+                        "feed_incrementality": feed.header.incrementality,
+                    })
+                except Exception as error:
+                    presence_ok = False
+                    presence_error = _redact_error(error, self.config.api_key)
+                    self.logger.exception("CRITICAL: presence write failed; forcing full raw fallback")
+            else:
+                self.presence.invalidate("parse_observation_gap")
+                presence_ok = False
 
         if parse_ok:
             tracker = self.trackers.get(result.feed_name)
@@ -456,7 +519,7 @@ class Collector:
                 spool_error = _redact_error(error, self.config.api_key)
                 self.logger.exception("Failed staging %s; preserving a raw fallback", result.feed_name)
 
-        if not parse_ok or not change_tracking_ok or not spool_ok:
+        if not parse_ok or not change_tracking_ok or not spool_ok or not presence_ok:
             # Force a full snapshot when TripUpdates was between its normal raw
             # intervals, so any parser/spool loss remains reconstructible.
             if not raw_archived:
@@ -481,6 +544,8 @@ class Collector:
             min_entity_timestamp=min_entity_timestamp,
             max_entity_timestamp=max_entity_timestamp,
             parse_ok=parse_ok,
+            presence_ok=presence_ok,
+            presence_details=presence_details,
             change_tracking_ok=change_tracking_ok,
             change_tracking_failure_flag=change_tracking_failure_flag,
             raw_ok=raw_ok,
@@ -496,6 +561,7 @@ class Collector:
         event = {
             "version": 1,
             "poll_id": result.poll_id,
+            "run_id": self.run_id,
             "feed": result.feed_name,
             "poll_interval_seconds": self.config.feed_intervals[result.feed_name],
             **self._schedule_event_fields(schedule),
@@ -504,7 +570,13 @@ class Collector:
             "http_status": result.http_status,
             "latency_ms": round(result.latency_ms, 3),
             "success": True,
-            "error": parse_error or change_tracking_error or spool_error,
+            "error": parse_error or change_tracking_error or spool_error or presence_error,
+            "processing_latency_ms": round((time.monotonic() - processing_started) * 1000, 3),
+            "processing_queue_latency_ms": round(queue_latency_ms, 3),
+            "presence_required": result.feed_name == "tripupdates",
+            "presence_ok": presence_ok if result.feed_name == "tripupdates" else None,
+            "presence_error": presence_error,
+            **presence_details,
             "parse_error": parse_error,
             "change_tracking_ok": change_tracking_ok,
             "change_tracking_error": change_tracking_error,
@@ -630,6 +702,8 @@ class Collector:
                 if item is not None:
                     try:
                         if item.worker_error is not None:
+                            if item.feed_name == "tripupdates":
+                                self.presence.invalidate("http_observation_gap")
                             cycle_errors.append(f"{item.feed_name}:unexpected_fetch_worker_failure")
                             self.logger.error(
                                 "Unexpected fetch worker failure for %s: %s",
@@ -639,6 +713,8 @@ class Collector:
                         else:
                             self.process_result(item.value, cycle_errors, item)
                     except Exception as error:
+                        if item.feed_name == "tripupdates":
+                            self.presence.invalidate("unexpected_processing_gap")
                         cycle_errors.append(f"{item.feed_name}:unexpected_processing_failure")
                         self.logger.exception(
                             "Unexpected result-processing failure for %s: %s",
@@ -659,6 +735,8 @@ class Collector:
             try:
                 for item in self.scheduler.stop_and_drain():
                     if item.worker_error is not None:
+                        if item.feed_name == "tripupdates":
+                            self.presence.invalidate("http_observation_gap")
                         self.logger.error("Unexpected fetch worker failure during shutdown for %s: %s",
                                           item.feed_name, _redact_error(item.worker_error, self.config.api_key))
                         continue

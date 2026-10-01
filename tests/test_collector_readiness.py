@@ -13,16 +13,22 @@ from google.transit import gtfs_realtime_pb2 as pb
 from urllib3.exceptions import NewConnectionError
 import collector as collector_module
 import rebuild_parquet
-from atomic_io import sha256_file
+from atomic_io import atomic_write_json, read_json, sha256_file
+from backup import BackupManager
 from collector import Collector, FetchResult, _new_session
 from config import CollectorConfig, FEED_NAMES
 from gtfs_rt_parse import parse_trip_updates
+from manifests import _presence_stats, build_daily_manifest
 from monitoring import poll_journal_path, utc_iso
 from parquet_store import DurableParquetSpool, MAX_SEGMENTS_PER_COMMIT, parquet_row_count, write_parquet_atomic
 from parquet_worker import ParquetCommitWorker
 from poll_journal import append_poll_jsonl, recent_partition_files, repair_jsonl_tail
 from raw_log import append_record, scan_raw_log
 from realtime_scheduler import IndependentFeedScheduler
+from static_gtfs import StaticGtfsStore
+from tests.test_reliability import FakeBackupApi, StaticSession, gtfs_zip_bytes
+from tripupdate_presence import TripUpdatePresence, apply_presence_record, iter_presence, presence_path
+from verify_backup import verify_day
 
 
 def sample(feed_name: str, timestamp: int, sequences=(1, 2)) -> pb.FeedMessage:
@@ -85,6 +91,8 @@ class ReadinessFixture(unittest.TestCase):
     def rows(self, sequences=(1, 2)):
         return parse_trip_updates(sample("tripupdates", int(self.now), sequences), self.context("source"))
 
+    def records(self, date=None):
+        return [record for _timestamp, record in iter_presence(presence_path(self.data, date or self.date))]
 
 
 
@@ -172,6 +180,7 @@ class ParquetIsolationTests(ReadinessFixture):
                 self.assertEqual([0, 0, 0], [state[feed]["total_missed_deadlines"] for feed in FEED_NAMES])
                 self.assertTrue(old.exists(), "writer has not consumed its durable source")
                 self.assertFalse(release.is_set())
+                self.assertEqual(4, len(self.records()), "membership evidence persists while commits are blocked")
                 for feed in FEED_NAMES:
                     events = [json.loads(line) for line in poll_journal_path(self.data, feed, self.date).read_text().splitlines()]
                     self.assertEqual(4 if feed != "alerts" else 2, len(events))
@@ -234,6 +243,148 @@ class ParquetIsolationTests(ReadinessFixture):
                 status = value._commit_and_write_status("status", [])
                 self.assertFalse(status["healthy"])
                 self.assertIn(reason, status["reasons"])
+
+
+
+class PresenceTests(ReadinessFixture):
+    def test_withdrawal_and_reappearance_survive_even_when_prediction_rows_are_suppressed(self):
+        value = self.collector()
+        for index, sequences in enumerate(((1, 2), (1,), (1, 2))):
+            value.process_result(response("tripupdates", sample("tripupdates", int(self.now), sequences),
+                                          str(index), self.now + index * 10), [])
+        events = [json.loads(line) for line in poll_journal_path(self.data, "tripupdates", self.date).read_text().splitlines()]
+        self.assertEqual([2, 0, 0], [event["emitted_rows"] for event in events])
+        records = self.records()
+        self.assertEqual(1, len(records[1]["changes"][0]["withdrawn_stops"]))
+        self.assertEqual(1, len(records[2]["changes"][0]["entered_stops"]))
+        self.assertEqual(1, scan_raw_log(self.data / "raw" / "tripupdates" / f"date={self.date}" / "tripupdates.rawlog").complete_records)
+
+    def test_baseline_empty_delta_withdrawal_and_unchanged_reappearance_replay(self):
+        value = TripUpdatePresence(self.data, "run")
+        rows = self.rows()
+        value.observe(rows, self.date, self.now, self.context("one"))
+        value.observe(rows, self.date, self.now + 10, self.context("two"))
+        value.observe(rows[:1], self.date, self.now + 20, self.context("three"))
+        value.observe(rows, self.date, self.now + 30, self.context("four"))
+        value.observe([], self.date, self.now + 40, self.context("five"))
+        records = self.records()
+        self.assertEqual(["baseline", "delta", "delta", "delta", "delta"], [r["kind"] for r in records])
+        self.assertEqual([], records[1]["changes"])
+        self.assertEqual(2, records[0]["stop_count"], "repeated stop IDs remain distinct visits")
+        self.assertEqual(1, len(records[2]["changes"][0]["withdrawn_stops"]))
+        self.assertEqual(1, len(records[3]["changes"][0]["entered_stops"]))
+        self.assertTrue(records[4]["changes"][0]["trip_withdrawn"])
+        members = {}
+        for record in records:
+            members = apply_presence_record(members, record)
+        self.assertEqual({}, members)
+
+    def test_trip_only_entity_is_present_without_invented_stop(self):
+        value = TripUpdatePresence(self.data, "run")
+        value.observe(self.rows(()), self.date, self.now, self.context("trip-only"))
+        record = self.records()[0]
+        self.assertEqual((1, 0), (record["trip_count"], record["stop_count"]))
+        self.assertEqual([], record["changes"][0]["entered_stops"])
+        self.assertEqual(1, len(apply_presence_record({}, record)))
+
+    def test_failure_midnight_and_process_restart_are_baselines_not_withdrawals(self):
+        value = TripUpdatePresence(self.data, "run-one")
+        value.observe(self.rows(), self.date, self.now, self.context("one"))
+        value.invalidate("http_observation_gap")
+        value.observe([], self.date, self.now + 10, self.context("after-outage"))
+        self.assertEqual("http_observation_gap", self.records()[-1]["baseline_reason"])
+        self.assertEqual([], self.records()[-1]["changes"], "unobserved trips must not be called withdrawals")
+        tomorrow = (datetime.fromtimestamp(self.now, timezone.utc).date() + timedelta(days=1)).isoformat()
+        value.observe(self.rows(), tomorrow, self.now + 86400, self.context("midnight"))
+        self.assertEqual("utc_date_boundary", self.records(tomorrow)[0]["baseline_reason"])
+        restarted = TripUpdatePresence(self.data, "run-two")
+        restarted.observe(self.rows(), tomorrow, self.now + 86410, self.context("restart"))
+        records = self.records(tomorrow)
+        self.assertEqual("process_start", records[-1]["baseline_reason"])
+        self.assertEqual(1, records[-1]["sequence"])
+        self.assertNotEqual(records[0]["stream_id"], records[-1]["stream_id"])
+
+    def test_failed_presence_append_never_advances_delta_state(self):
+        value = TripUpdatePresence(self.data, "run")
+        value.observe(self.rows(), self.date, self.now, self.context("one"))
+        with patch("tripupdate_presence.append_record", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                value.observe([], self.date, self.now + 10, self.context("lost"))
+        value.observe(self.rows(), self.date, self.now + 20, self.context("recovered"))
+        self.assertEqual(2, len(self.records()))
+        self.assertEqual("baseline", self.records()[-1]["kind"])
+        self.assertEqual("presence_write_gap", self.records()[-1]["baseline_reason"])
+
+    def test_presence_failure_forces_raw_between_normal_snapshots_and_unhealthy(self):
+        value = self.collector()
+        value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), "first", self.now), [])
+        with patch("tripupdate_presence.append_record", side_effect=OSError("disk full")):
+            value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), "second", self.now + 10), [])
+        raw = self.data / "raw" / "tripupdates" / f"date={self.date}" / "tripupdates.rawlog"
+        self.assertEqual(2, scan_raw_log(raw).complete_records)
+        self.assertIn("tripupdates_presence_failed", value.monitor.feeds["tripupdates"]["freshness_flags"])
+        events = [json.loads(line) for line in poll_journal_path(self.data, "tripupdates", self.date).read_text().splitlines()]
+        self.assertFalse(events[-1]["presence_ok"])
+        self.assertTrue(events[-1]["raw_archived"])
+        self.assertEqual(300, events[-1]["raw_archive_interval_seconds"])
+        value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), "third", self.now + 20), [])
+        self.assertEqual("presence_write_gap", self.records()[-1]["baseline_reason"])
+
+    def test_http_and_parse_failures_invalidate_without_false_withdrawals(self):
+        for error in ("http", "parse"):
+            with self.subTest(error=error):
+                value = self.collector()
+                value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), error + "-one", self.now), [])
+                bad = response("tripupdates", None, error + "-bad", self.now + 10)
+                if error == "parse":
+                    bad = response("tripupdates", sample("vehiclepositions", int(self.now)), error + "-bad", self.now + 10)
+                value.process_result(bad, [])
+                value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), error + "-three", self.now + 20), [])
+                self.assertEqual("baseline", self.records()[-1]["kind"])
+                self.assertEqual(error + "_observation_gap", self.records()[-1]["baseline_reason"])
+
+    def test_differential_feed_is_not_interpreted_as_full_membership(self):
+        value = self.collector()
+        value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), "full", self.now), [])
+        differential = sample("tripupdates", int(self.now), ())
+        differential.header.incrementality = pb.FeedHeader.DIFFERENTIAL
+        value.process_result(response("tripupdates", differential, "partial", self.now + 10), [])
+        self.assertEqual(1, len(self.records()))
+        raw = self.data / "raw" / "tripupdates" / f"date={self.date}" / "tripupdates.rawlog"
+        self.assertEqual(2, scan_raw_log(raw).complete_records)
+
+    def test_manifest_refuses_missing_or_corrupt_promised_presence(self):
+        value = TripUpdatePresence(self.data, "run")
+        details = value.observe(self.rows(), self.date, self.now, self.context("one"))
+        event = {"poll_id": "one", "presence_required": True, "presence_ok": True, "parse_ok": True, **details}
+        stats, errors, quality = _presence_stats(self.data, self.date, [event])
+        self.assertEqual([], errors)
+        self.assertEqual([], quality)
+        self.assertEqual(1, stats["journal_confirmed_observations"])
+        path = presence_path(self.data, self.date)
+        original = path.read_bytes()
+        path.write_bytes(original[:-1])
+        self.assertTrue(_presence_stats(self.data, self.date, [event])[1])
+        path.unlink()
+        self.assertTrue(_presence_stats(self.data, self.date, [event])[1])
+
+    def test_manifest_reports_legacy_without_inventing_presence(self):
+        stats, errors, quality = _presence_stats(self.data, self.date, [{"poll_id": "old", "parse_ok": True}])
+        self.assertEqual([], errors)
+        self.assertEqual([], quality)
+        self.assertEqual(1, stats["legacy_pre_presence_polls"])
+        self.assertEqual(0, stats["records"])
+
+    def test_manifest_flags_mixed_version_presence_without_calling_http_failures_legacy(self):
+        value = TripUpdatePresence(self.data, "run")
+        details = value.observe(self.rows(), self.date, self.now, self.context("new"))
+        events = [{"poll_id": "old", "parse_ok": True},
+                  {"poll_id": "http-failed", "parse_ok": False},
+                  {"poll_id": "new", "parse_ok": True, "presence_required": True, "presence_ok": True, **details}]
+        stats, errors, quality = _presence_stats(self.data, self.date, events)
+        self.assertEqual([], errors)
+        self.assertEqual(1, stats["legacy_pre_presence_polls"])
+        self.assertTrue(any("mixed-version" in flag for flag in quality))
 
 
 
@@ -417,6 +568,70 @@ class RebuildSafetyTests(ReadinessFixture):
             self.assertEqual(0, rebuild_parquet.main())
             self.assertEqual(1, run.call_count)
             self.assertEqual(self.date, run.call_args.args[1])
+
+
+
+class CoverageAndRestoreTests(ReadinessFixture):
+    def test_new_presence_and_run_metadata_are_in_verified_backup_receipt(self):
+        self.date = "2026-09-24"
+        self.now = datetime.strptime(self.date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() + 3600
+        value = self.collector()
+        for feed in FEED_NAMES:
+            value.process_result(response(feed, sample(feed, int(self.now)), feed, self.now), [])
+        self.assertTrue(value.spool.flush(force=True).ok)
+        static = StaticGtfsStore(self.data, check_interval_seconds=86400, retry_seconds=1)
+        static.check(StaticSession([gtfs_zip_bytes("readiness")]), now_ts=self.now - 7200)
+        manifest = build_daily_manifest(self.data, self.date, static)
+        self.assertTrue(manifest["complete"], manifest["completeness_errors"])
+        api = FakeBackupApi(self.data)
+        manager = BackupManager(self.data, "owner/archive", "fake-token", static, api=api, logger=Mock())
+        result = manager.backup_date(self.date)
+        self.assertTrue(result.success, result.reason)
+        receipt = read_json(self.data / "backup_receipts" / f"date={self.date}.json", {})
+        self.assertTrue(receipt["remote_verified"])
+        manifest_path = self.data / "metadata" / "manifests" / f"date={self.date}.json"
+        self.assertEqual(receipt["manifest_sha256"], sha256_file(manifest_path))
+        self.assertEqual(1, read_json(manifest_path, {})["feeds"]["tripupdates"]["presence"]["records"])
+        names = {artifact["path"] for artifact in receipt["artifacts"]}
+        self.assertIn(str(presence_path(self.data, self.date).relative_to(self.data)), names)
+        self.assertIn(f"metadata/collector_runs/{value.run_id}.json", names)
+        self.assertTrue(any(path.endswith("polls.jsonl.checkpoint.json") for path in names))
+        for artifact in receipt["artifacts"]:
+            self.assertEqual((artifact["size"], artifact["sha256"]), api.remote[artifact["path"]])
+        run_metadata = read_json(self.data / "metadata" / "collector_runs" / f"{value.run_id}.json", {})
+        self.assertEqual(value.config.feed_intervals, run_metadata["poll_intervals_seconds"])
+        self.assertEqual(value.config.trip_update_numeric_tolerances, run_metadata["numeric_tolerances"])
+        self.assertNotIn(value.config.api_key, json.dumps(run_metadata))
+        missing_presence = dict(manifest, artifacts=[artifact for artifact in manifest["artifacts"]
+                                                     if artifact["kind"] != "tripupdates_presence"])
+        with self.assertRaisesRegex(ValueError, "presence evidence"):
+            BackupManager._validate_manifest(self.date, missing_presence)
+
+
+    def test_restore_samples_new_evidence_and_journal_not_just_checkpoints(self):
+        date = "2026-09-24"
+        kinds = ("raw", "parquet", "daily_manifest", "poll_metadata", "static_gtfs",
+                 "static_gtfs_history", "static_gtfs_state", "tripupdates_presence", "collector_run_metadata")
+        names = {"raw": "raw/f.rawlog", "poll_metadata": "metadata/polls/f/polls.jsonl",
+                 "tripupdates_presence": "metadata/tripupdates_presence/presence.jsonlog"}
+        artifacts = [{"path": names.get(kind, kind + ".json"), "kind": kind, "size": 100, "sha256": "a" * 64}
+                     for kind in kinds]
+        artifacts += [{"path": names[kind] + ".checkpoint.json", "kind": kind, "size": 1, "sha256": "a" * 64}
+                      for kind in ("raw", "poll_metadata", "tripupdates_presence")]
+        receipt_path = self.data / "backup_receipts" / f"date={date}.json"
+        atomic_write_json(receipt_path, {"version": 2, "date": date, "repo_id": "owner/archive",
+                                       "remote_verified": True, "artifacts": artifacts})
+        manager = Mock(data_dir=self.data, repo_id="owner/archive")
+        with patch("verify_backup.receipt_revision", return_value="b" * 40), \
+                patch("verify_backup.restore_artifact", side_effect=lambda _m, artifact, _r, path:
+                      (path.write_bytes(b"temporary"), {"path": artifact["path"], "result": "PASS"})[1]):
+            result = verify_day(manager, date)
+        restored = [entry["path"] for entry in result["restored"]]
+        self.assertEqual(9, len(restored))
+        self.assertIn(names["tripupdates_presence"], restored)
+        self.assertIn(names["poll_metadata"], restored)
+        self.assertFalse(any(path.endswith(".checkpoint.json") for path in restored))
+        self.assertTrue(result["temporary_directory_removed"])
 
 
 

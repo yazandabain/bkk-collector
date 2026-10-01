@@ -65,12 +65,19 @@ def verify_day(manager: BackupManager, date: str, *, all_files: bool = False) ->
     artifacts = receipt["artifacts"]
     manager._verify_remote(artifacts, revision=revision)
     if not all_files:
+        kinds = ["raw", "parquet", "daily_manifest", "poll_metadata", "static_gtfs",
+                 "static_gtfs_history", "static_gtfs_state"]
+        # Old receipts remain valid. New evidence must also be demonstrably
+        # restorable, not just its much smaller checkpoint sidecar.
+        kinds.extend(kind for kind in ("tripupdates_presence", "collector_run_metadata")
+                     if any(a["kind"] == kind for a in artifacts))
         artifacts = [min(
-            (a for a in artifacts if a["kind"] == kind and (kind != "raw" or a["path"].endswith(".rawlog"))
-             and (kind != "poll_metadata" or a["path"].endswith(".jsonl"))),
+            (a for a in artifacts if a["kind"] == kind
+             and (kind != "raw" or a["path"].endswith(".rawlog"))
+             and (kind != "poll_metadata" or a["path"].endswith(".jsonl"))
+             and (kind != "tripupdates_presence" or a["path"].endswith(".jsonlog"))),
             key=lambda a: a["size"],
-        ) for kind in ("raw", "parquet", "daily_manifest", "poll_metadata", "static_gtfs",
-                       "static_gtfs_history", "static_gtfs_state")]
+        ) for kind in kinds]
     results = []
     # TemporaryDirectory only owns this newly created directory. Never use
     # repository/data roots for cleanup. One downloaded file occupies disk.
