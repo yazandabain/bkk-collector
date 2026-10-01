@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -142,15 +143,17 @@ def rebuild_one(
                     )
                     if tracker:
                         rows = tracker.filter(rows, date_str, timestamp)
-                    buffer.extend(rows)
-                    while len(buffer) >= chunk_rows:
-                        chunk = buffer[:chunk_rows]
-                        del buffer[:chunk_rows]
-                        written_rows += _flush_chunk(feed_name, chunk, staging, part)
-                        part += 1
                 except Exception as error:
                     failures += 1
                     print(f"  parse failed at {received}: {type(error).__name__}: {error}")
+                    continue
+                # Storage errors are never authorized by --allow-parse-errors.
+                buffer.extend(rows)
+                while len(buffer) >= chunk_rows:
+                    chunk = buffer[:chunk_rows]
+                    written_rows += _flush_chunk(feed_name, chunk, staging, part)
+                    del buffer[:chunk_rows]
+                    part += 1
         if failures and not allow_parse_errors:
             raise RuntimeError(f"{failures} raw record(s) failed parsing; existing Parquet was left untouched")
         if buffer or part == 0:
@@ -185,7 +188,7 @@ def all_dates_for(feed_name: str) -> list[str]:
     return sorted(path.name.removeprefix("date=") for path in root.glob("date=*"))
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", help="YYYY-MM-DD; default is all completed raw dates")
     parser.add_argument("--feed", choices=FEED_NAMES, help="default: all feeds")
@@ -196,8 +199,12 @@ def main() -> None:
     if args.chunk_rows <= 0:
         parser.error("--chunk-rows must be positive")
 
+    failed = False
     for feed_name in ([args.feed] if args.feed else FEED_NAMES):
         dates = [args.date] if args.date else all_dates_for(feed_name)
+        if not args.date and not args.allow_current_date:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            dates = [date for date in dates if date < today]
         print(f"{feed_name}: rebuilding {len(dates)} date(s)")
         for date_str in dates:
             try:
@@ -209,13 +216,15 @@ def main() -> None:
                     allow_current_date=args.allow_current_date,
                 )
             except Exception as error:
+                failed = True
                 print(f"  {date_str}: FAILED: {type(error).__name__}: {error}")
             else:
                 print(
                     f"  {date_str}: {result['raw_records']} snapshots -> {result['rows']} rows; "
                     f"previous={result['previous_partition'] or 'none'}"
                 )
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

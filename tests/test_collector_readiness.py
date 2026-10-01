@@ -5,15 +5,19 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 from google.transit import gtfs_realtime_pb2 as pb
 from urllib3.exceptions import NewConnectionError
+import rebuild_parquet
+from atomic_io import sha256_file
 from collector import Collector, FetchResult, _new_session
 from config import CollectorConfig
 from gtfs_rt_parse import parse_trip_updates
 from monitoring import utc_iso
+from parquet_store import parquet_row_count, write_parquet_atomic
+from raw_log import append_record
 
 
 def sample(feed_name: str, timestamp: int, sequences=(1, 2)) -> pb.FeedMessage:
@@ -114,6 +118,71 @@ class RetryRedactionTests(ReadinessFixture):
                 logger.exception("failed request")
         self.assertNotIn(canary, "\n".join(captured.output))
         self.assertIn("<redacted>", "\n".join(captured.output))
+
+
+
+class RebuildSafetyTests(ReadinessFixture):
+    def setUp(self):
+        super().setUp()
+        self.date = "2026-09-24"
+        for name, value in (("DATA_DIR", self.data), ("RAW_DIR", self.data / "raw"), ("PARQUET_DIR", self.data / "parquet")):
+            patcher = patch.object(rebuild_parquet, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.raw = self.data / "raw" / "vehiclepositions" / f"date={self.date}" / "vehiclepositions.rawlog"
+        for index in range(3):
+            append_record(self.raw, self.now + index * 10, sample("vehiclepositions", int(self.now)).SerializeToString())
+        self.original = self.data / "parquet" / "vehiclepositions" / f"date={self.date}" / "part-original.parquet"
+        write_parquet_atomic("vehiclepositions", [{"entity_id": "original"}], self.original)
+
+    def test_write_error_cannot_be_dismissed_as_parse_error_or_replace_original(self):
+        raw_hash, original_hash = sha256_file(self.raw), sha256_file(self.original)
+        real_write = write_parquet_atomic
+        for allow in (False, True):
+            calls = []
+
+            def fail_late(feed, rows, path):
+                calls.append(path)
+                if len(calls) == 2:
+                    raise OSError("disk full on second output")
+                return real_write(feed, rows, path)
+
+            with self.subTest(allow_parse_errors=allow), patch("rebuild_parquet.write_parquet_atomic", side_effect=fail_late):
+                with self.assertRaisesRegex(OSError, "second output"):
+                    rebuild_parquet.rebuild_one("vehiclepositions", self.date, chunk_rows=1, allow_parse_errors=allow)
+            self.assertEqual(raw_hash, sha256_file(self.raw))
+            self.assertEqual(original_hash, sha256_file(self.original))
+            self.assertEqual([], list((self.data / "parquet" / ".rebuild-staging").glob("*/date=*")))
+
+    def test_explicitly_allowed_genuine_parse_error_still_preserves_previous_partition(self):
+        append_record(self.raw, self.now + 30, b"not valid protobuf")
+        with self.assertRaises(RuntimeError):
+            rebuild_parquet.rebuild_one("vehiclepositions", self.date, chunk_rows=1)
+        result = rebuild_parquet.rebuild_one("vehiclepositions", self.date, chunk_rows=1, allow_parse_errors=True)
+        self.assertEqual(1, result["parse_failures"])
+        self.assertEqual(3, result["rows"])
+        previous = Path(result["previous_partition"])
+        self.assertTrue((previous / "part-original.parquet").is_file())
+        self.assertEqual(3, sum(map(parquet_row_count, self.original.parent.glob("*.parquet"))))
+
+    def test_cli_returns_failure_and_continues_remaining_dates(self):
+        result = {"raw_records": 1, "rows": 1, "previous_partition": None}
+        with patch("sys.argv", ["rebuild_parquet.py", "--feed", "vehiclepositions"]), \
+                patch("rebuild_parquet.all_dates_for", return_value=["2026-09-23", "2026-09-24"]), \
+                patch("rebuild_parquet.rebuild_one", side_effect=[OSError("disk full"), result]) as run, \
+                patch("sys.stdout", io.StringIO()):
+            self.assertEqual(1, rebuild_parquet.main())
+            self.assertEqual(2, run.call_count)
+
+    def test_cli_default_skips_current_and_future_dates(self):
+        tomorrow = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
+        with patch("sys.argv", ["rebuild_parquet.py", "--feed", "vehiclepositions"]), \
+                patch("rebuild_parquet.all_dates_for", return_value=[self.date, utc_iso()[:10], tomorrow]), \
+                patch("rebuild_parquet.rebuild_one", return_value={"raw_records": 1, "rows": 1, "previous_partition": None}) as run, \
+                patch("sys.stdout", io.StringIO()):
+            self.assertEqual(0, rebuild_parquet.main())
+            self.assertEqual(1, run.call_count)
+            self.assertEqual(self.date, run.call_args.args[1])
 
 
 
