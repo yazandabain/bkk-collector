@@ -66,7 +66,8 @@ def verify_day(manager: BackupManager, date: str, *, all_files: bool = False) ->
     manager._verify_remote(artifacts, revision=revision)
     if not all_files:
         artifacts = [min(
-            (a for a in artifacts if a["kind"] == kind and (kind != "raw" or a["path"].endswith(".rawlog"))),
+            (a for a in artifacts if a["kind"] == kind and (kind != "raw" or a["path"].endswith(".rawlog"))
+             and (kind != "poll_metadata" or a["path"].endswith(".jsonl"))),
             key=lambda a: a["size"],
         ) for kind in ("raw", "parquet", "daily_manifest", "poll_metadata", "static_gtfs",
                        "static_gtfs_history", "static_gtfs_state")]

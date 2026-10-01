@@ -31,6 +31,7 @@ from dedup import ChangeTracker, ChangeTrackerSignalError
 from gtfs_rt_parse import PARSERS, parse_feed
 from monitoring import HealthMonitor, append_poll_event, entity_timestamp_range, utc_iso
 from parquet_store import DurableParquetSpool
+from poll_journal import recent_partition_files, repair_jsonl_tail
 from raw_log import append_record, repair_truncated_tail
 from realtime_scheduler import IndependentFeedScheduler, ScheduledResult
 from trip_update_policy import (
@@ -233,6 +234,18 @@ class Collector:
     # Compatibility for callers of the v2.0 method name.
     recover_current_raw_tails = recover_recent_raw_tails
 
+    def recover_recent_journal_tails(self) -> None:
+        today = datetime.now(timezone.utc).date().isoformat()
+        for feed_name in FEED_NAMES:
+            root = self.config.data_dir / "metadata" / "polls" / feed_name
+            for path in recent_partition_files(root, "polls.jsonl", today):
+                try:
+                    recovery = repair_jsonl_tail(path)
+                    if recovery:
+                        self.logger.error("Preserved torn poll journal tail: %s", recovery)
+                except Exception:
+                    self.logger.exception("CRITICAL: poll journal tail remains unsafe: %s", path)
+
     def fetch_feed(self, feed_name: str, poll_id: str) -> FetchResult:
         started_ts = time.time()
         started = utc_iso(started_ts)
@@ -365,7 +378,9 @@ class Collector:
             event = self._failure_event(result, schedule)
             try:
                 append_poll_event(self.config.data_dir, result.feed_name, date_str, event)
+                self.monitor.feeds[result.feed_name]["poll_journal_ok"] = True
             except Exception:
+                self.monitor.feeds[result.feed_name]["poll_journal_ok"] = False
                 cycle_errors.append(f"{result.feed_name}:poll_journal_failed")
                 self.logger.exception("CRITICAL: failed to append poll failure journal for %s", result.feed_name)
             return
@@ -519,9 +534,13 @@ class Collector:
         }
         try:
             append_poll_event(self.config.data_dir, result.feed_name, date_str, event)
+            self.monitor.feeds[result.feed_name]["poll_journal_ok"] = True
         except Exception:
+            self.monitor.feeds[result.feed_name]["poll_journal_ok"] = False
             cycle_errors.append(f"{result.feed_name}:poll_journal_failed")
             self.logger.exception("CRITICAL: failed to append poll journal for %s", result.feed_name)
+            if not raw_archived:
+                self._archive_raw(result, date_str, force=True)
 
     def _commit_and_write_status(
         self,
@@ -586,6 +605,7 @@ class Collector:
     def run(self) -> None:
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         self.recover_recent_raw_tails()
+        self.recover_recent_journal_tails()
         recovered = self.spool.flush(force=True)
         if recovered.errors:
             self.logger.error("Startup spool recovery is pending: %s", "; ".join(recovered.errors))

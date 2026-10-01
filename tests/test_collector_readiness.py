@@ -1,5 +1,6 @@
 from __future__ import annotations
 import io
+import json
 import logging
 import tempfile
 import threading
@@ -13,11 +14,12 @@ from urllib3.exceptions import NewConnectionError
 import rebuild_parquet
 from atomic_io import sha256_file
 from collector import Collector, FetchResult, _new_session
-from config import CollectorConfig
+from config import CollectorConfig, FEED_NAMES
 from gtfs_rt_parse import parse_trip_updates
-from monitoring import utc_iso
+from monitoring import poll_journal_path, utc_iso
 from parquet_store import parquet_row_count, write_parquet_atomic
-from raw_log import append_record
+from poll_journal import append_poll_jsonl, recent_partition_files, repair_jsonl_tail
+from raw_log import append_record, scan_raw_log
 
 
 def sample(feed_name: str, timestamp: int, sequences=(1, 2)) -> pb.FeedMessage:
@@ -80,6 +82,86 @@ class ReadinessFixture(unittest.TestCase):
     def rows(self, sequences=(1, 2)):
         return parse_trip_updates(sample("tripupdates", int(self.now), sequences), self.context("source"))
 
+
+
+
+class JournalRecoveryTests(ReadinessFixture):
+    def test_journal_failure_stays_unhealthy_until_same_feed_append_recovers(self):
+        value = self.collector()
+        for feed in FEED_NAMES:
+            value.process_result(response(feed, sample(feed, int(self.now)), feed, self.now), [])
+        with patch("collector.append_poll_event", side_effect=OSError("journal unavailable")):
+            value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), "missing", self.now + 10), [])
+        value.process_result(response("vehiclepositions", sample("vehiclepositions", int(self.now)), "other-feed", self.now + 11), [])
+        status = value._commit_and_write_status("status", [])
+        self.assertFalse(status["healthy"])
+        self.assertIn("tripupdates:poll_journal_failed", status["reasons"])
+        raw = self.data / "raw" / "tripupdates" / f"date={self.date}" / "tripupdates.rawlog"
+        self.assertEqual(2, scan_raw_log(raw).complete_records, "journal loss also forces raw fallback")
+        value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), "recovered", self.now + 20), [])
+        status = value._commit_and_write_status("recovered-status", [])
+        self.assertTrue(status["healthy"], status["reasons"])
+
+    def test_torn_final_line_is_detached_and_all_valid_records_survive(self):
+        path = self.data / "polls.jsonl"
+        append_poll_jsonl(path, {"poll_id": "one"})
+        original = path.read_bytes()
+        torn = b'{"poll_id":"two","text":"\xf0\x9f'
+        with path.open("ab") as handle:
+            handle.write(torn)
+        recovered = repair_jsonl_tail(path)
+        self.assertEqual(torn, recovered.read_bytes())
+        self.assertEqual(original, path.read_bytes())
+        append_poll_jsonl(path, {"poll_id": "three"})
+        self.assertEqual(["one", "three"], [json.loads(line)["poll_id"] for line in path.read_text().splitlines()])
+        self.assertIsNone(repair_jsonl_tail(path))
+
+    def test_legacy_complete_json_without_separator_is_preserved(self):
+        path = self.data / "polls.jsonl"
+        path.write_bytes(b'{"poll_id":"one"}\n{"poll_id":"two"}')
+        self.assertIsNone(repair_jsonl_tail(path))
+        append_poll_jsonl(path, {"poll_id": "three"})
+        self.assertEqual(["one", "two", "three"], [json.loads(line)["poll_id"] for line in path.read_text().splitlines()])
+
+    def test_checkpoint_failure_preserves_complete_append(self):
+        path = self.data / "polls.jsonl"
+        append_poll_jsonl(path, {"poll_id": "one"})
+        with patch("poll_journal.atomic_write_json", side_effect=OSError("checkpoint full")):
+            with self.assertRaises(OSError):
+                append_poll_jsonl(path, {"poll_id": "two"})
+        append_poll_jsonl(path, {"poll_id": "three"})
+        self.assertEqual(["one", "two", "three"], [json.loads(line)["poll_id"] for line in path.read_text().splitlines()])
+
+    def test_interior_corruption_is_not_destructively_repaired(self):
+        path = self.data / "polls.jsonl"
+        append_poll_jsonl(path, {"poll_id": "one"})
+        with path.open("ab") as handle:
+            handle.write(b'bad interior line\n{"poll_id":"three"}\n')
+        original = path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "interior corruption"):
+            repair_jsonl_tail(path)
+        self.assertEqual(original, path.read_bytes())
+        self.assertEqual([], list(self.data.glob("*.corrupt-tail-*")))
+
+    def test_restart_after_midnight_repairs_today_and_latest_prior_only(self):
+        value = self.collector()
+        yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+        older = (datetime.now(timezone.utc).date() - timedelta(days=2)).isoformat()
+        for feed in FEED_NAMES:
+            for date in (older, yesterday, self.date):
+                path = poll_journal_path(self.data, feed, date)
+                path.parent.mkdir(parents=True)
+                path.write_bytes(b'{"poll_id":"valid"}\n{"torn":')
+        value.recover_recent_journal_tails()
+        for feed in FEED_NAMES:
+            root = self.data / "metadata" / "polls" / feed
+            self.assertEqual([yesterday, self.date], [p.parent.name[5:] for p in recent_partition_files(root, "polls.jsonl", self.date)])
+            for date in (yesterday, self.date):
+                path = poll_journal_path(self.data, feed, date)
+                self.assertEqual(b'{"poll_id":"valid"}\n', path.read_bytes())
+                self.assertEqual(1, len(list(path.parent.glob("*.corrupt-tail-*"))))
+            self.assertTrue(poll_journal_path(self.data, feed, older).read_bytes().endswith(b'{"torn":'))
+        self.assertEqual([], recent_partition_files(self.data / "missing", "polls.jsonl", self.date))
 
 
 

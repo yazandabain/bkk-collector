@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import Any
 
 import realcity
-from atomic_io import append_jsonl, atomic_write_json, read_json
+from atomic_io import atomic_write_json, read_json
 from config import FEED_NAMES
+from poll_journal import append_poll_jsonl
 
 
 def utc_iso(timestamp: float | None = None) -> str:
@@ -229,6 +230,8 @@ class HealthMonitor:
                 reasons.append(f"{feed_name}:absent")
             if int(state.get("consecutive_failures", 0)):
                 reasons.append(f"{feed_name}:http_failed")
+            if state.get("poll_journal_ok") is False:
+                reasons.append(f"{feed_name}:poll_journal_failed")
             for flag in state.get("freshness_flags", []):
                 target = warnings if flag.endswith("_warning") else reasons
                 target.append(f"{feed_name}:{flag}")
@@ -284,7 +287,7 @@ def poll_journal_path(data_dir: Path, feed_name: str, date_str: str) -> Path:
 
 
 def append_poll_event(data_dir: Path, feed_name: str, date_str: str, event: dict[str, Any]) -> None:
-    append_jsonl(poll_journal_path(data_dir, feed_name, date_str), event, fsync=True)
+    append_poll_jsonl(poll_journal_path(data_dir, feed_name, date_str), event)
 
 
 def iter_jsonl(path: Path):

@@ -227,8 +227,9 @@ def build_daily_manifest(
         for path in sorted((data_dir / "parquet" / feed_name / f"date={date_str}").glob("*.parquet")):
             artifacts.append(_artifact(data_dir, path, "parquet"))
         journal = poll_journal_path(data_dir, feed_name, date_str)
-        if journal.exists():
-            artifacts.append(_artifact(data_dir, journal, "poll_metadata"))
+        for path in sorted(journal.parent.glob(journal.name + "*")):
+            if path.is_file():
+                artifacts.append(_artifact(data_dir, path, "poll_metadata"))
     if applicable_static is not None:
         # Include every distinct static version known locally, not just today's
         # applicable one. This also brings preserved v1-era static archives into
