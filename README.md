@@ -27,6 +27,13 @@ disk before dedup state advances and survives a collector crash, but it is not
 equivalent to full 10-second raw protobuf history. The first successful sample
 after every collector start is always raw-archived for every feed.
 
+TripUpdates also has a separate, fsynced presence log at every valid full-feed
+observation. It records trip/stop-visit membership, including unchanged polls,
+withdrawals, and reappearances. This does not change prediction compression or
+raw cadence; absence means only absent from that observation, not cancellation
+or completion. This evidence starts with the new version and cannot repair
+the missing high-frequency presence history in older collection.
+
 `DELAY_CHANGE_THRESHOLD_SECONDS=15` controls delay-field emission, while
 `TRIPUPDATE_TIME_TOLERANCE_SECONDS` independently controls absolute
 arrival/departure prediction revisions (2 seconds by default). Stored
@@ -92,10 +99,12 @@ docker compose run --rm --no-deps maintenance python diagnostics.py prediction-r
   --date YYYY-MM-DD --start-hour 7 --end-hour 11 --max-snapshots 40
 ```
 
-Prediction-time tolerance is provisional. Validate it using consecutive
-observations at the actual polling cadence; five-minute raw snapshots
-cannot establish an optimal tolerance for ten-second observations. Keep
-the setting configurable and preserve large revisions without clamping.
+The 2-second prediction-time tolerance is provisional. Initial validation used
+night-service observations, not representative daytime traffic across all
+services. Keep it configurable and evaluate it with consecutive observations
+at the actual polling cadence. Five-minute snapshots cannot establish an
+optimal tolerance for ten-second observations. The diagnostics report large
+revisions without clamping them.
 
 ## Process architecture
 
@@ -114,6 +123,14 @@ forces a raw snapshot for that poll. Derived rows are written to small atomic,
 gzip-compressed spool segments. Commits decode one segment at a time and write
 at most 4,096 rows per Arrow batch. A successful, validated atomic
 Parquet commit is the only event that removes those segments.
+
+One background Parquet thread is the sole commit/recovery owner; the main
+ingestion thread never waits for its flush, including startup recovery. There
+is no extra in-memory row queue: immutable disk spool segments are the queue.
+Failures retain the segments and retry after 30 seconds. Normal commits run
+at the configured Parquet flush interval. Threads still share CPU, memory,
+and disk, so sustained overload can coalesce polling deadlines; this is not
+a guarantee of zero missing polls under resource exhaustion.
 
 `maintenance` is a separate process/container. It performs:
 
@@ -137,14 +154,22 @@ Docker restarts the two processes independently.
   legacy logs are scanned once to establish that checkpoint.
 - Spool files are atomically renamed into place. If Parquet writing fails,
   every segment remains pending and is retried. On startup, pending segments
-  are flushed before the next poll.
+  recover in the background while polling starts immediately.
 - A crash after the Parquet rename but before spool cleanup is idempotent: the
   deterministic output is row-count validated, then the old segments are
   removed. If external/manual changes make the transaction ambiguous, cleanup
   stops and preserves source segments for inspection rather than risking loss.
 - SIGTERM/SIGINT stops new submissions, waits for bounded in-flight requests,
-  durably processes their results, forces a spool flush, and exits. If Parquet
-  remains unavailable, the durable spool remains on disk.
+  durably processes their results, and asks the Parquet worker to stop between
+  batches. It does not drain an entire historical spool backlog before exiting.
+  Interrupted commits recover from durable source segments/transaction markers.
+- Poll journals have a fsynced byte checkpoint. Startup checks today's and the
+  latest prior existing journal; a torn final line is detached to forensic
+  `*.corrupt-tail-*` bytes. Complete JSON missing only a newline is retained.
+  Interior corruption is refused, never silently removed.
+- TripUpdates presence starts a new baseline after startup, UTC midnight, or
+  an HTTP/parse/presence-write gap. No withdrawals are invented across those
+  gaps. Unsupported differential feeds force raw fallback and unhealthy status.
 - Every derived file and state JSON uses a same-directory temporary file plus
   `fsync` and atomic rename.
 - Compaction writes and validates its output before deleting source parts. A
@@ -163,6 +188,10 @@ data/
   parquet/<feed>/date=YYYY-MM-DD/part-*.parquet
   spool/<feed>/date=YYYY-MM-DD/batch-*.json.gz
   metadata/polls/<feed>/date=YYYY-MM-DD/polls.jsonl
+  metadata/polls/<feed>/date=YYYY-MM-DD/polls.jsonl.checkpoint.json
+  metadata/tripupdates_presence/date=YYYY-MM-DD/presence.jsonlog
+  metadata/tripupdates_presence/date=YYYY-MM-DD/presence.jsonlog.checkpoint.json
+  metadata/collector_runs/<run_id>.json
   metadata/manifests/date=YYYY-MM-DD.json
   metadata/legacy_inventory.json       # only after explicit migration
   static_gtfs/
@@ -195,6 +224,18 @@ Poll journals contain the per-feed configured cadence, scheduler deadline/lag,
 coalesced missed deadlines, HTTP status, request/response timestamps, latency,
 payload size/SHA-256, feed header timestamp, min/max entity timestamps where
 available, raw/parse/spool outcomes, row counts, and freshness incidents.
+They also include ingestion/queue latency, run ID, and confirmed TripUpdates
+presence stream/sequence. Run metadata records only allowlisted non-secret
+settings (cadences, numeric tolerances, heartbeat, fsync, schema/commit).
+
+`presence.jsonlog` uses the same timestamp/length/gzip framing as raw logs,
+but its payload is JSON, not protobuf. `tripupdate_presence.iter_presence`
+reads it; `apply_presence_record` replays its versioned baselines/deltas.
+Trip identities are `entity_id, trip_id, start_date, start_time`; stop-visit
+identities are `stop_sequence, stop_visit_fallback_index, stop_id`. A record
+confirms membership even with an empty change list. Trip-only entities retain
+an empty stop set. Stream IDs and sequence numbers detect missing deltas; new
+baselines reset knowledge rather than asserting disappearance during a gap.
 
 Parquet schema version 2 keeps scalar research fields plus canonical JSON for
 repeated/nested structures. It includes current standard GTFS-RT metadata,
@@ -210,6 +251,8 @@ when querying mixed historical files, use schema unioning (for example DuckDB
 For every completed UTC day, maintenance builds a manifest with:
 
 - per-feed cadence and expected/attempted/successful/failed polls;
+- journal/data-success count ratios, exact reported scheduler misses, and
+  successful response gap samples/maxima, with UTC boundary gaps separate;
 - first and last successes;
 - raw snapshot counts and raw-log integrity;
 - parsed/emitted/Parquet row counts;
@@ -223,6 +266,17 @@ For every completed UTC day, maintenance builds a manifest with:
 backed up. `quality_ok` is stricter evidence about polling gaps/staleness. A
 real HTTP-200 empty feed has a raw protobuf, poll evidence, and a typed empty
 Parquet artifact. Missing collection does not masquerade as an empty feed.
+The previous 90% poll-count cutoff no longer hides sustained losses: more
+than one boundary poll missing, or any reported scheduler miss, flags quality.
+Count ratios are **not exact time coverage**; request latency and UTC edges
+can move observations. HTTP failures, parse/storage failures, source freshness,
+and scheduler misses remain separate counters. `successful_data_polls` counts
+normal-path success; `failed_processing_polls_with_raw_evidence` distinguishes
+failed processing with a confirmed full raw payload from proven missing bytes.
+A gap measures response times, not a proven count of upstream predictions lost.
+Previously receipted manifests
+remain immutable. New-day manifests replay and validate promised presence
+evidence and include its hashes, forensic tails, and referenced run metadata.
 
 Backup backlog is derived as:
 
@@ -314,15 +368,16 @@ docker compose run --rm --no-deps maintenance python verify_backup.py YYYY-MM-DD
 
 The command verifies every remote artifact's hash and downloads representatives
 including an actual `.rawlog`, Parquet, static ZIP, manifest, journal, and static
-history/state. Old v2 receipts lacking a revision are resolved to the historical
+history/state, plus presence/run metadata when the receipt contains them.
+Old v2 receipts lacking a revision are resolved to the historical
 receipt-upload commit and checked against the local receipt hash. Restoring
 old static metadata from HF `main` is incorrect: those paths are mutable.
 
 Verified retention bounds raw/Parquet caches only when backup succeeds.
-Protected static versions and poll journals continue growing. Size local
-disk and remote archive capacity from observed daily growth, retention
-windows, and the planned collection duration. Check the actual free-space
-and archive-quota trends regularly.
+Protected static versions, poll journals, and presence logs continue growing.
+Size local disk and remote archive capacity from observed daily growth,
+retention windows, and the planned collection duration. Check the actual
+free-space and archive-quota trends regularly.
 
 Hugging Face is one off-server copy, not a complete 3-2-1 backup strategy. For
 irreplaceable research, periodically replicate the dataset repo to a second
@@ -373,6 +428,7 @@ HTTP 200 alone is not healthy. The collector persists and evaluates:
 - unchanged entity-content hash duration (excluding the changing feed header);
 - time since last successful response;
 - HTTP, protobuf parse, raw write, spool, and Parquet commit failures separately;
+- TripUpdates presence persistence and background writer liveness/duration;
 - per-feed scheduler lag, in-flight duration, and coalesced missed deadlines;
 - free disk space.
 
@@ -383,6 +439,8 @@ and payload freshness checks remain strict. Daily manifests distinguish
 `freshness_warning_polls` from `stale_feed_polls`; old immutable manifests are
 not rewritten. A current failed HTTP request is unhealthy until a successful
 response clears it.
+Poll-journal write failures remain unhealthy until that same feed durably
+appends another event; a success from a different feed cannot mask them.
 
 Docker marks `collector` unhealthy when `health/status.json` is stale or
 degraded. `maintenance` independently checks daily static freshness and a stale
@@ -411,9 +469,25 @@ jq . data/metadata/manifests/date=YYYY-MM-DD.json
 jq . data/backup_receipts/date=YYYY-MM-DD.json
 ```
 
-Any spool segments older than the configured five-minute flush, repeated
-`CRITICAL`, `Parquet flush failed`, stale-source reasons, low disk, or a growing
-backup backlog requires investigation.
+Any persistent/growing spool backlog, repeated `CRITICAL` or `Parquet commit
+failed`, stale-source reasons, low disk, or a growing backup backlog requires
+investigation. `health/status.json.parquet_worker` reports the last commit
+duration/row count, failures, and active time. A dead worker or a commit active
+for more than 600 seconds fails health. Recent scheduler misses remain warnings
+for five minutes even after the next request resets its transient counter.
+
+Inspect persisted observations in a specific deployment/monitoring window:
+
+```bash
+docker compose exec -T collector python diagnostics.py collection-window \
+  --since YYYY-MM-DDT00:00:00Z
+```
+
+This streams local journals, contacts no services, changes no files, and reports
+HTTP/parse/storage/presence failures separately from scheduler misses and
+response gaps. Its exit status indicates that the report was readable, not
+that collection is healthy; also run both healthcheck commands. Heavy full-day
+diagnostics should use a separate one-off container as described below.
 
 The 1536 MiB Compose values are limits, not reservations. They remain at the
 existing conservative defaults. Raw/static hashing and downloads stream in
@@ -422,11 +496,16 @@ record batches; spool commits group at most 20 segments but decode only one
 at a time, with Arrow batches capped at 4,096 rows. Daily journals are
 the only completed-day structure materialized by manifest generation and are
 small enough at the supported cadence. Use `docker stats` to look for a rising
-baseline or a maintenance process repeatedly approaching its limit. An OOM in
-maintenance cannot kill or block the separately limited collector, and atomic
-compaction markers preserve recovery state. Heavy archive diagnostics are run
+baseline or a maintenance process repeatedly approaching its limit.
+A maintenance cgroup OOM is isolated from the separately limited collector,
+but shared host CPU/disk pressure can still affect both. Atomic compaction
+markers preserve recovery state. Heavy archive diagnostics are run
 as one-off `maintenance` containers, not inside the realtime collector's memory
 cgroup; schedule full-day reports away from a CPU-constrained peak period.
+Background commits overlap ingestion memory. Keep the current limits and
+check real restart/peak-period memory after deployment.
+Presence journals are protected metadata, not part of raw/Parquet eviction;
+measure their real daily growth and include it in disk/HF capacity planning.
 
 To validate the currently deployed BKK realCity population without archiving a
 probe or exposing the key, run:
@@ -501,7 +580,7 @@ large.
 ## Safe upgrade from collector v1
 
 Building does not stop the realtime service. Legacy inventory is optional;
-existing best-effort data do not need migration. Do not overwrite the
+existing best-effort data does not need migration. Do not overwrite the
 server's existing `.env`; add the three explicit
 cadences. A remaining `POLL_INTERVAL_SECONDS` is harmless and deprecated because
 feed-specific values win. Set pruning to zero for the first 24–48 hours while
@@ -586,7 +665,10 @@ docker compose start maintenance
 
 By default, a corrupt raw tail or any parse failure leaves the current Parquet
 untouched. `--allow-parse-errors` is an explicit acceptance of partial derived
-output and should only be used after inspecting the raw issue. Rebuilding the
+output and should only be used after inspecting the raw issue. It never permits
+ignoring storage failures: any failed output write aborts installation and
+preserves the previous partition. The CLI exits nonzero if any requested date
+fails; default enumeration excludes current/future dates. Rebuilding the
 current UTC date is refused unless explicitly overridden; stop the collector
 before using that override.
 
@@ -621,6 +703,13 @@ protobuf optionals, multi-period/multilingual/BKK alerts, raw-tail recovery,
 static hash behavior, real PyArrow schemas, compaction row preservation, empty
 versus missing daily artifacts, backup retry/remote verification, independent
 scheduler behavior, and a full synthetic three-feed collection pass.
+It also exercises a real Parquet write paused during continuing scheduled
+ingestion, presence withdrawal/reappearance/restart replay, forced raw fallback,
+forensic journal recovery, retry-log redaction, rebuild write errors, and new
+evidence in verified backup receipts.
+
+For safe updates, see the [deployment and recovery guide](docs/deployment.md).
+It covers offline image tests, image-based rollback, and continuity checks.
 
 ## Deployment rollback
 
