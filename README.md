@@ -158,6 +158,9 @@ Docker restarts the two processes independently.
   the proven-valid prefix then safely accepts new records. An atomic last-good
   byte checkpoint makes later restarts inspect only a possible trailing append;
   legacy logs are scanned once to establish that checkpoint.
+- Destructive raw/presence and poll-journal tail repair requires a successful
+  directory sync of the forensic copy before truncation. If that sync fails,
+  the original remains untouched and repair fails visibly.
 - Spool files are atomically renamed into place. If Parquet writing fails,
   every segment remains pending and is retried. On startup, pending segments
   recover in the background while polling starts immediately.

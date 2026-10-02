@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import struct
 import tempfile
 import threading
 import time
@@ -16,7 +17,7 @@ from urllib3.exceptions import NewConnectionError
 
 import collector as collector_module
 import rebuild_parquet
-from atomic_io import atomic_write_json, read_json, sha256_file
+from atomic_io import atomic_write_json, fsync_directory, read_json, sha256_file
 from backup import BackupManager
 from collector import Collector, FetchResult, _new_session
 from config import CollectorConfig, FEED_NAMES
@@ -27,7 +28,7 @@ from monitoring import HealthMonitor, append_poll_event, poll_journal_path, utc_
 from parquet_store import DurableParquetSpool, MAX_SEGMENTS_PER_COMMIT, parquet_row_count, write_parquet_atomic
 from parquet_worker import ParquetCommitWorker
 from poll_journal import append_poll_jsonl, recent_partition_files, repair_jsonl_tail
-from raw_log import append_record, iter_records, scan_raw_log
+from raw_log import MAX_COMPRESSED_RECORD_BYTES, append_record, iter_records, repair_truncated_tail, scan_raw_log
 from realtime_scheduler import IndependentFeedScheduler
 from static_gtfs import StaticGtfsStore
 from tests.test_reliability import FakeBackupApi, StaticSession, gtfs_zip_bytes
@@ -483,6 +484,119 @@ class PresenceTests(ReadinessFixture):
         self.assertEqual([], errors)
         self.assertEqual(1, stats["legacy_pre_presence_polls"])
         self.assertTrue(any("mixed-version" in flag for flag in quality))
+
+
+class ForensicDurabilityTests(ReadinessFixture):
+    def raw_fixture(self, name):
+        path = self.data / name
+        append_record(path, self.now, b'{"poll_id":"first"}')
+        prefix = path.read_bytes()
+        later = self.data / ("later-" + name)
+        append_record(later, self.now + 10, b'{"poll_id":"later-valid-record"}')
+        # Preserve valid later bytes even when an invalid header precedes them.
+        tail = struct.pack(">dI", self.now, MAX_COMPRESSED_RECORD_BYTES + 1) + later.read_bytes()
+        with path.open("ab") as handle:
+            handle.write(tail)
+        return path, prefix, tail
+
+    def test_raw_and_presence_tail_entry_is_synced_before_source_truncation(self):
+        for name in ("feed.rawlog", "presence.jsonlog"):
+            with self.subTest(name=name):
+                path, prefix, tail = self.raw_fixture(name)
+
+                def sync(directory, *, strict=False):
+                    self.assertTrue(strict)
+                    self.assertEqual(prefix + tail, path.read_bytes())
+                    copies = list(path.parent.glob(path.name + ".corrupt-tail-*"))
+                    self.assertEqual(1, len(copies))
+                    self.assertEqual(tail, copies[0].read_bytes())
+                    fsync_directory(directory, strict=strict)
+
+                with patch("raw_log.fsync_directory", side_effect=sync) as directory_sync:
+                    recovery = repair_truncated_tail(path)
+                directory_sync.assert_called_once_with(path.parent, strict=True)
+                self.assertEqual(prefix, path.read_bytes())
+                self.assertEqual(tail, recovery.read_bytes())
+                self.assertTrue(scan_raw_log(path).clean)
+
+    def test_raw_and_presence_sync_failure_leaves_original_bytes_and_checkpoint(self):
+        for name in ("feed.rawlog", "presence.jsonlog"):
+            with self.subTest(name=name):
+                path, prefix, tail = self.raw_fixture(name)
+                checkpoint = path.with_name(path.name + ".checkpoint.json")
+                original_checkpoint = checkpoint.read_bytes()
+                with patch("raw_log.fsync_directory", side_effect=OSError("directory sync failed")):
+                    with self.assertRaisesRegex(OSError, "directory sync failed"):
+                        repair_truncated_tail(path)
+                self.assertEqual(prefix + tail, path.read_bytes())
+                self.assertEqual(original_checkpoint, checkpoint.read_bytes())
+                copies = list(path.parent.glob(path.name + ".corrupt-tail-*"))
+                self.assertEqual(1, len(copies))
+                self.assertEqual(tail, copies[0].read_bytes())
+                # A later restart/retry can finish safely without removing the
+                # first forensic copy or changing any valid record's bytes.
+                recovery = repair_truncated_tail(path)
+                self.assertEqual(prefix, path.read_bytes())
+                self.assertEqual(tail, recovery.read_bytes())
+                self.assertEqual(2, len(list(path.parent.glob(path.name + ".corrupt-tail-*"))))
+
+    def test_poll_tail_entry_is_synced_before_source_truncation(self):
+        path = self.data / "polls.jsonl"
+        append_poll_jsonl(path, {"poll_id": "first"})
+        prefix = path.read_bytes()
+        tail = b'{"poll_id":"unfinished"'
+        with path.open("ab") as handle:
+            handle.write(tail)
+
+        def sync(directory, *, strict=False):
+            self.assertTrue(strict)
+            self.assertEqual(prefix + tail, path.read_bytes())
+            copies = list(path.parent.glob(path.name + ".corrupt-tail-*"))
+            self.assertEqual(1, len(copies))
+            self.assertEqual(tail, copies[0].read_bytes())
+            fsync_directory(directory, strict=strict)
+
+        with patch("poll_journal.fsync_directory", side_effect=sync) as directory_sync:
+            recovery = repair_jsonl_tail(path)
+        directory_sync.assert_called_once_with(path.parent, strict=True)
+        self.assertEqual(prefix, path.read_bytes())
+        self.assertEqual(tail, recovery.read_bytes())
+
+    def test_poll_tail_sync_failure_leaves_original_bytes_and_checkpoint(self):
+        path = self.data / "polls.jsonl"
+        append_poll_jsonl(path, {"poll_id": "first"})
+        prefix = path.read_bytes()
+        checkpoint = path.with_name(path.name + ".checkpoint.json")
+        original_checkpoint = checkpoint.read_bytes()
+        tail = b'{"poll_id":"unfinished"'
+        with path.open("ab") as handle:
+            handle.write(tail)
+        with patch("poll_journal.fsync_directory", side_effect=OSError("directory sync failed")):
+            with self.assertRaisesRegex(OSError, "directory sync failed"):
+                repair_jsonl_tail(path)
+        self.assertEqual(prefix + tail, path.read_bytes())
+        self.assertEqual(original_checkpoint, checkpoint.read_bytes())
+        copies = list(path.parent.glob(path.name + ".corrupt-tail-*"))
+        self.assertEqual(1, len(copies))
+        self.assertEqual(tail, copies[0].read_bytes())
+        recovery = repair_jsonl_tail(path)
+        self.assertEqual(prefix, path.read_bytes())
+        self.assertEqual(tail, recovery.read_bytes())
+        self.assertEqual(2, len(list(path.parent.glob(path.name + ".corrupt-tail-*"))))
+
+    def test_directory_sync_strict_failures_propagate_and_close_descriptor(self):
+        with patch("atomic_io.os.open", side_effect=PermissionError("directory unavailable")):
+            self.assertIsNone(fsync_directory(self.data))
+            with self.assertRaises(PermissionError):
+                fsync_directory(self.data, strict=True)
+        with patch("atomic_io.os.open", return_value=123), \
+                patch("atomic_io.os.fsync", side_effect=OSError("sync unsupported")), \
+                patch("atomic_io.os.close") as close:
+            self.assertIsNone(fsync_directory(self.data))
+            with self.assertRaisesRegex(OSError, "sync unsupported"):
+                fsync_directory(self.data, strict=True)
+            self.assertEqual(2, close.call_count)
+            close.assert_called_with(123)
 
 
 class JournalRecoveryTests(ReadinessFixture):

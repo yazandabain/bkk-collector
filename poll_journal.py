@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from atomic_io import append_jsonl, atomic_write_bytes, atomic_write_json, read_json
+from atomic_io import append_jsonl, atomic_write_bytes, atomic_write_json, fsync_directory, read_json
 
 
 def recent_partition_files(root: Path, filename: str, today: str) -> list[Path]:
@@ -84,6 +84,10 @@ def repair_jsonl_tail(path: Path) -> Path | None:
                     raise ValueError("journal has interior corruption; refusing destructive repair")
                 recovery = path.with_name(path.name + ".corrupt-tail-" + uuid.uuid4().hex)
                 atomic_write_bytes(recovery, line)
+                # Ordinary atomic writes allow unsupported directory syncs.
+                # Destructive recovery cannot: keep the original until its
+                # forensic replacement has a confirmed durable directory entry.
+                fsync_directory(path.parent, strict=True)
                 size = line_start
                 break
             add_separator = not line.endswith(b"\n")

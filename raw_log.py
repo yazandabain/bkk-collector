@@ -150,6 +150,10 @@ def repair_truncated_tail(path: Path) -> Path | None:
         shutil.copyfileobj(source, target)
         target.flush()
         os.fsync(target.fileno())
+    # The forensic file's contents and directory entry must both survive a
+    # crash before removing any source bytes. An unsupported/failed directory
+    # sync refuses destructive repair instead of risking those bytes.
+    fsync_directory(path.parent, strict=True)
     with open(path, "r+b") as handle:
         handle.truncate(scan.valid_bytes)
         handle.flush()

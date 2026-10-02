@@ -1,8 +1,9 @@
 """Small, dependency-free primitives for durable local state.
 
 All replacement writes happen in the destination directory so ``os.replace``
-is atomic on the mounted filesystem.  Directory fsync is best-effort because
-some filesystems (notably a few Docker Desktop mounts) do not support it.
+is atomic on the mounted filesystem. Directory fsync is best-effort by default
+because some filesystems do not support it. Destructive recovery requires
+strict confirmation before removing original bytes.
 """
 
 from __future__ import annotations
@@ -15,15 +16,18 @@ from pathlib import Path
 from typing import Any
 
 
-def fsync_directory(path: Path) -> None:
+def fsync_directory(path: Path, *, strict: bool = False) -> None:
     try:
         fd = os.open(path, os.O_RDONLY)
     except OSError:
+        if strict:
+            raise
         return
     try:
         os.fsync(fd)
     except OSError:
-        pass
+        if strict:
+            raise
     finally:
         os.close(fd)
 
