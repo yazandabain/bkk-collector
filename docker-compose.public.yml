@@ -1,0 +1,36 @@
+# Optional overlay. Starting public-exporter does not recreate either collector.
+services:
+  public-exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile.public
+    restart: unless-stopped
+    init: true
+    env_file: .env.public
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    cpus: 0.25
+    pids_limit: 32
+    stop_grace_period: 20s
+    tmpfs: [/tmp:size=16m,mode=1777]
+    volumes:
+      - ./data/raw/vehiclepositions:/input/raw:ro
+      - ./data/health:/input/health:ro
+      - ./data/maintenance:/input/maintenance:ro
+      - ./data/metadata/manifests:/input/manifests:ro
+      - ./data/backup_receipts:/input/receipts:ro
+      - ./data/static_gtfs:/input/static:ro
+      - ./public-output:/output
+    healthcheck:
+      test: [CMD, python, -m, public_exporter.healthcheck]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"

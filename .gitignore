@@ -2,6 +2,10 @@
 # healthcheck URL. .env.example is the safe, placeholder-only template that
 # IS committed.
 .env
+.env.*
+!.env.example
+!.env.public.example
+.dev.vars*
 *.key
 *.pem
 
@@ -29,3 +33,11 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Public site build and local credentials
+node_modules/
+dist/
+.wrangler/
+playwright-report/
+test-results/
+public-output/

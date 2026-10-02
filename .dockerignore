@@ -1,5 +1,10 @@
 .git
 .env
+.env.*
+node_modules
+frontend
+public-output
+.wrangler
 .venv
 __pycache__
 .pytest_cache
