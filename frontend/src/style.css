@@ -132,6 +132,20 @@ footer { padding-top: 23px; padding-bottom: 32px; border-top: 1px solid #dfe5eb;
 .footer-brand span { color: #8b9ba8; font-size: 9px; }
 .attribution { color: #8b9ba8; font-size: 8px; line-height: 1.8; text-align: right; }
 .attribution a { text-decoration: underline; text-underline-offset: 2px; }
+/* Small research labels must stay readable, not fade into the chrome. */
+.eyebrow, .research-label, .intro-status > span:last-child, .map-heading h2 > span,
+.observation-label small, .mode-filters button, .mode-filters button > span,
+.map-caption, .map-meta, .panel-heading p, .feed-meta, .source-details,
+.archive-state p, .archive-state small, .health-footnote, .quiet-note,
+.metric-label, .metric p, .coverage-strip span, .coverage-strip small,
+.dataset-note, .footer-brand span, .attribution { color: #5e7182; }
+.methodology-intro p, .architecture small, .resolution-list dd, .method-limitation { color: #5a746b; }
+.feed-index, .intro p { color: #5e7182; }
+.methodology .eyebrow, .architecture, .architecture i, .resolution-list dt, .method-link { color: #47695a; }
+.quality-flagged { color: #876127 !important; }
+.health-footnote, .dataset-note, .method-limitation { font-size: 10px; }
+.archive-state small, .attribution { font-size: 9px; }
+.resolution-list { font-size: 10px; }
 @media (min-width: 1600px) { .map-frame { height: 560px; } }
 @media (max-width: 1100px) {
   .masthead, main, footer { padding-left: 28px; padding-right: 28px; }

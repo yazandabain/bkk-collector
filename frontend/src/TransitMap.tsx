@@ -74,7 +74,7 @@ export function TransitMap({ snapshot, enabled, now }: { snapshot: Snapshot | nu
     {unavailable && <div className="map-loading"><strong>Map rendering is unavailable</strong><p>Your browser may not support WebGL. Live counts and feed health remain available below.</p></div>}
     {ready && (stale || !snapshot) && <div className="map-notice">{snapshot ? 'Last reported positions · source or public updates are stale' : 'Waiting for the first public snapshot'}</div>}
     {tileError && ready && <div className="map-tile-warning">Some basemap tiles are unavailable</div>}
-    {ready && <button className="map-reset" onClick={() => instance.current?.easeTo({ center: [19.065, 47.493], zoom: 11.1, duration: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 500 })} aria-label="Reset map to Budapest">⌖ <span>Budapest</span></button>}
+    {ready && <button className="map-reset" onClick={() => instance.current?.easeTo({ center: [19.065, 47.493], zoom: 11.1, duration: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 500 })} aria-label="Reset map to Budapest"><svg width="15" height="15" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="5" fill="none" stroke="currentColor" strokeWidth="1.4" /><path d="M10 1v5m0 8v5M1 10h5m8 0h5" stroke="currentColor" strokeWidth="1.4" /></svg><span>Budapest</span></button>}
     {selectedCurrent && <div className="vehicle-detail">
       <button className="close-detail" aria-label="Close vehicle details" onClick={() => setSelected(null)}>×</button>
       <span className="eyebrow">Selected vehicle</span>

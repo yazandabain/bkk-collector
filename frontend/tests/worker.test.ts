@@ -52,6 +52,15 @@ describe('public Worker boundary', () => {
     expect((await handle(publish(value), env)).status).toBe(400)
     expect(bucket.writes).toBe(0)
   })
+  it('discarded duplicate JSON values never leak into the public object', async () => {
+    const body = JSON.stringify(snapshotAt()).replace('{', '{"health":{"api_key":"hidden-secret"},')
+    const request = new Request('https://example.invalid/api/publish', {
+      method: 'PUT', headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' }, body,
+    })
+    expect((await handle(request, env)).status).toBe(204)
+    expect(bucket.payload).not.toContain('hidden-secret')
+    expect(bucket.payload).not.toContain('api_key')
+  })
   it('rejects oversized actual bodies and wrong media types', async () => {
     expect((await handle(publish('a'.repeat(2 * 1024 * 1024)), env)).status).toBe(413)
     expect((await handle(publish(snapshotAt(), secret, 'text/plain'), env)).status).toBe(415)

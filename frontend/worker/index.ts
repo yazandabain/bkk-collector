@@ -73,7 +73,9 @@ export async function handle(request: Request, env: Environment): Promise<Respon
       if (Math.abs(Date.now() - generated) > 120000) return new Response('Snapshot time invalid', { status: 400, headers: noCache })
       const previous = await env.SNAPSHOTS.head(KEY)
       if (previous && Number(previous.customMetadata?.generated) > generated) return new Response('Older snapshot refused', { status: 409, headers: noCache })
-      const result = await env.SNAPSHOTS.put(KEY, payload, {
+      // Re-serialize the validated value. Storing the original JSON could leak
+      // hidden earlier values of duplicate keys that JSON.parse superseded.
+      const result = await env.SNAPSHOTS.put(KEY, JSON.stringify(snapshot), {
         httpMetadata: { contentType: 'application/json; charset=utf-8' },
         customMetadata: { generated: String(generated) },
         onlyIf: previous ? { etagMatches: previous.etag } : { etagDoesNotMatch: '*' },

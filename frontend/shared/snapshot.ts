@@ -65,7 +65,7 @@ function count(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 }
 function nullableCount(value: unknown): boolean { return value === null || count(value) }
-function state(value: unknown): boolean { return ['healthy', 'degraded', 'unknown'].includes(String(value)) }
+function state(value: unknown): boolean { return typeof value === 'string' && ['healthy', 'degraded', 'unknown'].includes(value) }
 function finite(value: unknown, min: number, max: number): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max
 }
@@ -115,7 +115,7 @@ export function isSnapshot(value: unknown): value is Snapshot {
       || !['evidenced_days', 'verified_days', 'polls_recorded', 'event_rows', 'raw_snapshots'].every(key => count(stats[key]))) return false
   const latest = stats.latest_day
   if (latest !== null) {
-    if (!object(latest, ['date', 'quality', 'feeds']) || !date(latest.date) || !['good', 'flagged'].includes(String(latest.quality))) return false
+    if (!object(latest, ['date', 'quality', 'feeds']) || !date(latest.date) || typeof latest.quality !== 'string' || !['good', 'flagged'].includes(latest.quality)) return false
     const latestFeeds = latest.feeds
     if (!object(latestFeeds, feedNames) || !feedNames.every(name => dayCounts(latestFeeds[name]))) return false
   }

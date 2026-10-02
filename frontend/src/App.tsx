@@ -33,7 +33,7 @@ function HealthPanel({ snapshot, now, publicCurrent }: { snapshot: Snapshot | nu
         const feed = snapshot?.health.feeds[name]
         const state = publicCurrent ? feed?.state ?? 'unknown' : 'unknown'
         return <div className="feed" key={name}>
-          <div className="feed-title"><span className="feed-index">0{index + 1}</span><strong>{feedLabels[name]}</strong><span className={`state-dot state-${state}`} aria-label={state} /></div>
+          <div className="feed-title"><span className="feed-index">0{index + 1}</span><strong>{feedLabels[name]}</strong><span role="img" className={`state-dot state-${state}`} aria-label={state} /></div>
           <div className="feed-meta"><span>{feed?.cadence_seconds ? `Every ${feed.cadence_seconds}s` : 'Cadence unavailable'}</span><span>{ageLabel(age(feed?.observed_at ?? null, now))}</span></div>
           {feed?.issues.filter(code => !code.endsWith('_warning') || expanded).map(code => <p key={code} className="feed-issue">{issueLabels[code]}</p>)}
           {expanded && <dl className="source-details"><dt>Source timestamp</dt><dd>{localClock(feed?.source_at ?? null)}</dd><dt>Entities in response</dt><dd>{feed?.entities === null || feed?.entities === undefined ? 'Not available' : integer.format(feed.entities)}</dd></dl>}
@@ -42,7 +42,7 @@ function HealthPanel({ snapshot, now, publicCurrent }: { snapshot: Snapshot | nu
     </div>
     <button className="text-button" onClick={() => setExpanded(!expanded)} aria-expanded={expanded}>{expanded ? 'Hide source details −' : 'View source details +'} </button>
     <div className="archive-state">
-      <div><span className="archive-icon" aria-hidden="true">↗</span><strong>Off-site archive</strong><span className={`state-dot state-${publicCurrent ? maintenance?.state ?? 'unknown' : 'unknown'}`} /></div>
+      <div><span className="archive-icon" aria-hidden="true">↗</span><strong>Off-site archive</strong><span role="img" aria-label={`Archive ${publicCurrent ? maintenance?.state ?? 'unknown' : 'unknown'}`} className={`state-dot state-${publicCurrent ? maintenance?.state ?? 'unknown' : 'unknown'}`} /></div>
       <p>{maintenance?.archive_enabled ? `${maintenance.pending_days} completed ${maintenance.pending_days === 1 ? 'day' : 'days'} awaiting backup` : 'Archive status unavailable'}</p>
       <small>Last verified day: {snapshot?.statistics.last_verified_date ?? 'Not available'} (UTC)</small>
     </div>
@@ -74,7 +74,7 @@ export function App() {
   const { snapshot, error, now } = useSnapshot()
   const [enabled, setEnabled] = useState<Mode[]>([...modes])
   const state = effectiveState(snapshot, now)
-  const publicCurrent = !!snapshot && (age(snapshot.generated_at, now) ?? Infinity) <= 90
+  const publicCurrent = !!snapshot && (age(snapshot.generated_at, now) ?? Infinity) <= 90 && Date.parse(snapshot.generated_at) - now <= 30000
   const counts = useMemo(() => Object.fromEntries(modes.map(mode => [mode, snapshot?.vehicles.features.filter(vehicle => vehicle.properties.mode === mode).length ?? 0])) as Record<Mode, number>, [snapshot])
   const visible = enabled.reduce((sum, mode) => sum + counts[mode], 0)
   const sourceAge = age(snapshot?.vehicles.observed_at ?? null, now)

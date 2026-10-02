@@ -32,6 +32,11 @@ describe('closed public snapshot', () => {
     value.health.feeds.tripupdates.issues = ['error at private host?key=secret']
     expect(isSnapshot(value)).toBe(false)
   })
+  it('does not coerce array states into valid enum strings', () => {
+    const value = snapshotAt()
+    Object.assign(value.health, { state: ['healthy'] })
+    expect(isSnapshot(value)).toBe(false)
+  })
 })
 
 describe('honest freshness and coverage', () => {
