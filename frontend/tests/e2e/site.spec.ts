@@ -59,7 +59,7 @@ test('WebGL failure preserves live textual information', async ({ page }) => {
   await expect(page.getByText('Collection operational', { exact: true })).toBeVisible()
 })
 
-test('extra operational fields fail closed and script-like labels are text only', async ({ page }) => {
+test('extra operational fields fail closed', async ({ page }) => {
   await page.route('**/api/snapshot', route => {
     const snapshot = snapshotAt()
     Object.assign(snapshot, { secret: 'not-public' })
@@ -68,6 +68,30 @@ test('extra operational fields fail closed and script-like labels are text only'
   await page.goto('/')
   await expect(page.getByRole('status')).toContainText('temporarily unavailable')
   await expect(page.getByText('not-public')).not.toBeVisible()
+})
+
+test('vehicle selection renders source labels as text, never HTML', async ({ page }) => {
+  const label = '<img src=x onerror=alert(1)>'
+  await page.route('**/api/snapshot', route => {
+    const value = snapshotAt()
+    value.vehicles.features[0].properties.route_label = label
+    return route.fulfill({ json: value })
+  })
+  let dialogs = 0
+  page.on('dialog', async dialog => { dialogs++; await dialog.dismiss() })
+  await page.goto('/')
+  await expect(page.getByRole('button', { name: 'Reset map to Budapest' })).toBeVisible()
+  const map = page.getByRole('region', { name: 'Interactive Budapest vehicle map' })
+  const bounds = (await map.boundingBox())!
+  const world = 512 * 2 ** 11.1
+  const mercator = (latitude: number) => (1 - Math.log(Math.tan(Math.PI / 4 + latitude * Math.PI / 360)) / Math.PI) / 2
+  await map.click({ position: { x: bounds.width / 2 + (19.055 - 19.065) * world / 360,
+    y: bounds.height / 2 + (mercator(47.497) - mercator(47.493)) * world } })
+  await expect(page.locator('.route-badge')).toHaveText(label)
+  await expect(page.locator('.route-badge img')).toHaveCount(0)
+  expect(dialogs).toBe(0)
+  await page.getByRole('button', { name: 'Close vehicle details' }).click()
+  await expect(page.locator('.vehicle-detail')).not.toBeVisible()
 })
 
 test('public interface passes automated accessibility checks', async ({ page }) => {

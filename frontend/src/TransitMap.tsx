@@ -31,7 +31,7 @@ export function TransitMap({ snapshot, enabled, now }: { snapshot: Snapshot | nu
     instance.current = map
     map.addControl(new NavigationControl({ showCompass: false }), 'top-right')
     map.on('load', () => {
-      map.addSource('vehicles', { type: 'geojson', data: empty })
+      map.addSource('vehicles', { type: 'geojson', data: empty, promoteId: 'public_id' })
       map.addLayer({ id: 'vehicle-halo', type: 'circle', source: 'vehicles', paint: {
         'circle-radius': ['interpolate', ['linear'], ['zoom'], 8, 4, 12, 7, 16, 10],
         'circle-color': '#ffffff', 'circle-opacity': 0.94,
@@ -47,7 +47,7 @@ export function TransitMap({ snapshot, enabled, now }: { snapshot: Snapshot | nu
       setTileError(false)
     })
     map.on('click', 'vehicles', event => {
-      const id = event.features?.[0]?.id
+      const id = event.features?.[0]?.properties.public_id
       const match = data.current?.vehicles.features.find(vehicle => vehicle.id === String(id))
       setSelected(match ?? null)
     })
@@ -60,7 +60,10 @@ export function TransitMap({ snapshot, enabled, now }: { snapshot: Snapshot | nu
   useEffect(() => {
     const map = instance.current
     if (!map || !ready) return
-    const features = snapshot?.vehicles.features.filter(vehicle => enabled.includes(vehicle.properties.mode)) ?? []
+    // GeoJSON tiling may omit string top-level IDs. Keep our opaque public ID
+    // as a promoted property so selection survives tiling and later refreshes.
+    const features = snapshot?.vehicles.features.filter(vehicle => enabled.includes(vehicle.properties.mode))
+      .map(vehicle => ({ ...vehicle, properties: { ...vehicle.properties, public_id: vehicle.id } })) ?? []
     ;(map.getSource('vehicles') as GeoJSONSource).setData({ type: 'FeatureCollection', features })
     if (selected && !features.some(vehicle => vehicle.id === selected.id)) setSelected(null)
   }, [snapshot, enabled, ready, selected])
