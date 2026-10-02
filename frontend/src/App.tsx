@@ -2,6 +2,7 @@ import { lazy, Suspense, useMemo, useState } from 'react'
 import { feedNames, modes, type Mode, type Snapshot, type State } from '../shared/snapshot'
 import { age, ageLabel, calendarDate, compact, coverage, effectiveState, feedLabels, integer, localClock, modeLabels } from './format'
 import { useSnapshot } from './useSnapshot'
+import { MapBoundary } from './MapBoundary'
 
 const github = 'https://github.com/yazandabain/bkk-collector'
 const TransitMap = lazy(() => import('./TransitMap').then(module => ({ default: module.TransitMap })))
@@ -92,7 +93,7 @@ export function App() {
         <div className="map-panel">
           <div className="map-heading"><div><span className="eyebrow">The network, now</span><h2>{snapshot ? integer.format(visible) : '—'} <span>reported vehicles</span></h2></div><span className={`observation-label ${(sourceAge ?? Infinity) > 90 ? 'observation-stale' : ''}`}><i />{ageLabel(sourceAge)}<small>observation</small></span></div>
           <div className="mode-filters" role="group" aria-label="Filter vehicles by transport mode">{modes.map(mode => <button key={mode} aria-pressed={enabled.includes(mode)} onClick={() => toggle(mode)} className={enabled.includes(mode) ? 'enabled' : ''}><i style={{ background: colors[mode] }} />{modeLabels[mode]}<span>{integer.format(counts[mode])}</span></button>)}</div>
-          <Suspense fallback={<div className="map-frame"><div className="map-loading"><span className="spinner" />Preparing the city map</div></div>}><TransitMap snapshot={snapshot} enabled={enabled} now={now} /></Suspense>
+          <MapBoundary><Suspense fallback={<div className="map-frame"><div className="map-loading"><span className="spinner" />Preparing the city map</div></div>}><TransitMap snapshot={snapshot} enabled={enabled} now={now} /></Suspense></MapBoundary>
           <div className="map-meta"><span>Positions from BKK GTFS-Realtime · refreshed independently</span><span>{snapshot?.vehicles.omitted_records ? `${snapshot.vehicles.omitted_records} records not plotted · ` : ''}No inferred movement or arrival promises</span></div>
         </div>
         <HealthPanel snapshot={snapshot} now={now} publicCurrent={publicCurrent} />

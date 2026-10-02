@@ -59,6 +59,16 @@ test('WebGL failure preserves live textual information', async ({ page }) => {
   await expect(page.getByText('Collection operational', { exact: true })).toBeVisible()
 })
 
+test('map module download failure does not remove health or statistics', async ({ page }) => {
+  await page.route(/\/assets\/TransitMap-[^/]+\.js$/, route => route.abort())
+  await page.route('**/api/snapshot', route => route.fulfill({ json: snapshotAt() }))
+  await page.goto('/')
+  await expect(page.getByText('The map could not be loaded')).toBeVisible()
+  await expect(page.getByText('Collection operational', { exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'A dataset that keeps growing.' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Reload the public page' })).toBeVisible()
+})
+
 test('extra operational fields fail closed', async ({ page }) => {
   await page.route('**/api/snapshot', route => {
     const snapshot = snapshotAt()
@@ -85,8 +95,13 @@ test('vehicle selection renders source labels as text, never HTML', async ({ pag
   const bounds = (await map.boundingBox())!
   const world = 512 * 2 ** 11.1
   const mercator = (latitude: number) => (1 - Math.log(Math.tan(Math.PI / 4 + latitude * Math.PI / 360)) / Math.PI) / 2
-  await map.click({ position: { x: bounds.width / 2 + (19.055 - 19.065) * world / 360,
-    y: bounds.height / 2 + (mercator(47.497) - mercator(47.493)) * world } })
+  const position = { x: bounds.width / 2 + (19.055 - 19.065) * world / 360,
+    y: bounds.height / 2 + (mercator(47.497) - mercator(47.493)) * world }
+  await expect.poll(async () => {
+    await map.hover({ position })
+    return page.locator('.maplibregl-canvas').evaluate(canvas => (canvas as HTMLElement).style.cursor)
+  }).toBe('pointer')
+  await map.click({ position })
   await expect(page.locator('.route-badge')).toHaveText(label)
   await expect(page.locator('.route-badge img')).toHaveCount(0)
   expect(dialogs).toBe(0)
