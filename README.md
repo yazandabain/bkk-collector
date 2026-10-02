@@ -27,6 +27,12 @@ disk before dedup state advances and survives a collector crash, but it is not
 equivalent to full 10-second raw protobuf history. The first successful sample
 after every collector start is always raw-archived for every feed.
 
+Standard auxiliary entities (shapes, dynamic stops, and trip modifications)
+may accompany the primary feed records. Their bytes remain in configured raw
+snapshots; only the feed's VehiclePositions, TripUpdates, or Alerts are
+projected into Parquet and TripUpdates presence. Invalid or wrong-primary
+entity payloads still fail health and force full raw fallback.
+
 TripUpdates also has a separate, fsynced presence log at every valid full-feed
 observation. It records trip/stop-visit membership, including unchanged polls,
 withdrawals, and reappearances. This does not change prediction compression or

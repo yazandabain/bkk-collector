@@ -246,6 +246,103 @@ class ParquetIsolationTests(ReadinessFixture):
 
 
 class PresenceTests(ReadinessFixture):
+    def test_trip_updates_with_shapes_keep_rows_presence_and_raw_cadence(self):
+        value = self.collector()
+        feed = sample("tripupdates", int(self.now))
+        for index in range(3):
+            shape = feed.entity.add(id=f"shape-{index}").shape
+            shape.shape_id = f"detour-{index}"
+            shape.encoded_polyline = "_p~iF~ps|U_ulLnnqC_mqNvxq`@"
+        value.process_result(response("tripupdates", feed, "first", self.now), [])
+        feed.entity[-1].shape.encoded_polyline += "??"
+        value.process_result(response("tripupdates", feed, "second", self.now + 10), [])
+
+        events = [json.loads(line) for line in poll_journal_path(self.data, "tripupdates", self.date).read_text().splitlines()]
+        self.assertTrue(all(event["parse_ok"] and event["presence_ok"] and event["spool_ok"] for event in events))
+        self.assertEqual([2, 2], [event["parsed_rows"] for event in events])
+        self.assertEqual([2, 0], [event["emitted_rows"] for event in events])
+        records = self.records()
+        self.assertEqual([1, 1], [record["trip_count"] for record in records])
+        self.assertEqual([2, 2], [record["stop_count"] for record in records])
+        self.assertEqual([], records[-1]["changes"])
+        raw = self.data / "raw" / "tripupdates" / f"date={self.date}" / "tripupdates.rawlog"
+        with raw.open("rb") as handle:
+            snapshots = list(iter_records(handle))
+        self.assertEqual(1, len(snapshots))
+        archived = pb.FeedMessage.FromString(snapshots[0][1])
+        self.assertEqual(3, sum(entity.HasField("shape") for entity in archived.entity))
+        self.assertEqual([], value.monitor.feeds["tripupdates"]["freshness_flags"])
+        result = value.spool.flush(force=True)
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(2, sum(parquet_row_count(path) for path in result.files_written))
+        self.assertEqual(300, value.config.tripupdates_raw_archive_seconds)
+        self.assertEqual(2, value.config.prediction_time_change_threshold_seconds)
+
+    def test_auxiliary_entities_are_supported_across_all_primary_feeds(self):
+        for feed_name in FEED_NAMES:
+            with self.subTest(feed=feed_name):
+                value = self.collector()
+                feed = sample(feed_name, int(self.now))
+                shape = feed.entity.add(id="shape").shape
+                shape.shape_id, shape.encoded_polyline = "detour", "??"
+                stop = feed.entity.add(id="dynamic-stop").stop
+                stop.stop_id = "new-stop"
+                feed.entity.add(id="modifications").trip_modifications.SetInParent()
+                value.process_result(response(feed_name, feed, feed_name, self.now), [])
+                event = json.loads(poll_journal_path(self.data, feed_name, self.date).read_text().splitlines()[-1])
+                self.assertTrue(event["parse_ok"], event["parse_error"])
+                self.assertTrue(event["spool_ok"])
+                self.assertEqual(2 if feed_name == "tripupdates" else 1, event["parsed_rows"])
+                if feed_name == "tripupdates":
+                    self.assertTrue(event["presence_ok"])
+                    self.assertEqual(1, self.records()[-1]["trip_count"])
+
+    def test_auxiliary_only_full_feed_confirms_no_trip_updates(self):
+        value = self.collector()
+        value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), "first", self.now), [])
+        empty = pb.FeedMessage()
+        empty.header.gtfs_realtime_version = "2.0"
+        empty.header.timestamp = int(self.now + 10)
+        shape = empty.entity.add(id="shape").shape
+        shape.shape_id, shape.encoded_polyline = "detour", "??"
+        value.process_result(response("tripupdates", empty, "second", self.now + 10), [])
+        record = self.records()[-1]
+        self.assertEqual(0, record["trip_count"])
+        self.assertEqual(0, record["stop_count"])
+        self.assertTrue(record["changes"][0]["trip_withdrawn"])
+        event = json.loads(poll_journal_path(self.data, "tripupdates", self.date).read_text().splitlines()[-1])
+        self.assertTrue(event["parse_ok"] and event["presence_ok"])
+        self.assertEqual(0, event["parsed_rows"])
+
+    def test_invalid_primary_entities_force_raw_without_false_withdrawals(self):
+        for invalid in ("empty", "wrong-primary", "ambiguous"):
+            with self.subTest(payload=invalid):
+                value = self.collector()
+                value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), invalid + "-first", self.now), [])
+                records_before = len(self.records())
+                segments_before = len(value.spool.pending_segments())
+                bad = sample("tripupdates", int(self.now))
+                if invalid == "empty":
+                    bad.entity.add(id="empty")
+                elif invalid == "wrong-primary":
+                    wrong = bad.entity.add(id="wrong").vehicle
+                    wrong.position.latitude, wrong.position.longitude = 47.5, 19.0
+                else:
+                    shape = bad.entity[0].shape
+                    shape.shape_id, shape.encoded_polyline = "detour", "??"
+                value.process_result(response("tripupdates", bad, invalid + "-bad", self.now + 10), [])
+                event = json.loads(poll_journal_path(self.data, "tripupdates", self.date).read_text().splitlines()[-1])
+                self.assertFalse(event["parse_ok"])
+                self.assertFalse(event["presence_ok"])
+                self.assertTrue(event["raw_archived"] and event["raw_ok"])
+                self.assertEqual(0, event["emitted_rows"])
+                self.assertEqual(records_before, len(self.records()))
+                self.assertEqual(segments_before, len(value.spool.pending_segments()))
+                self.assertIn("protobuf_parse_failed", value.monitor.feeds["tripupdates"]["freshness_flags"])
+                value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), invalid + "-recovered", self.now + 20), [])
+                self.assertEqual("baseline", self.records()[-1]["kind"])
+                self.assertEqual("parse_observation_gap", self.records()[-1]["baseline_reason"])
+
     def test_withdrawal_and_reappearance_survive_even_when_prediction_rows_are_suppressed(self):
         value = self.collector()
         for index, sequences in enumerate(((1, 2), (1,), (1, 2))):

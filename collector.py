@@ -101,6 +101,24 @@ def _redact_error(error: BaseException, api_key: str) -> str:
     return f"{type(error).__name__}: {_redact_text(str(error), api_key)}"[:1000]
 
 
+def _validate_feed_entities(feed_name: str, feed: Any) -> None:
+    """Allow standard auxiliary entities alongside feed-specific records.
+
+    Shapes, dynamic stops and trip modifications remain in raw snapshots;
+    only the expected primary entities become rows/presence. Empty, ambiguous
+    or wrong-primary payloads remain errors, preventing false withdrawals.
+    """
+    expected = {"vehiclepositions": "vehicle", "tripupdates": "trip_update", "alerts": "alert"}[feed_name]
+    allowed = {expected, "shape", "stop", "trip_modifications"}
+    for entity in feed.entity:
+        if entity.is_deleted:
+            continue  # Presence separately refuses deletions in FULL_DATASET.
+        payloads = {field.name for field, _value in entity.ListFields()
+                    if field.type == field.TYPE_MESSAGE and not field.is_extension}
+        if len(payloads) != 1 or not payloads <= allowed:
+            raise ValueError(f"{feed_name} response contains an unexpected or invalid entity type")
+
+
 class _HttpLogRedaction(logging.Filter):
     def __init__(self, api_key: str):
         super().__init__()
@@ -449,9 +467,7 @@ class Collector:
         presence_error = None
         try:
             feed = parse_feed(result.payload)
-            expected_entity = {"vehiclepositions": "vehicle", "tripupdates": "trip_update", "alerts": "alert"}[result.feed_name]
-            if any(not entity.HasField(expected_entity) and not entity.is_deleted for entity in feed.entity):
-                raise ValueError(f"{result.feed_name} response contains an unexpected entity type")
+            _validate_feed_entities(result.feed_name, feed)
             content_digest = hashlib.sha256()
             for serialized_entity in sorted(entity.SerializeToString() for entity in feed.entity):
                 content_digest.update(len(serialized_entity).to_bytes(8, "big"))
