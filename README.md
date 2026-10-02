@@ -7,6 +7,11 @@ data-quality evidence over infrastructure complexity.
 
 Data source attribution: **BKK Zrt., CC BY 4.0**.
 
+An isolated public observatory shows the current vehicle map, sanitized feed
+health and evidence-backed collection statistics. It has no collector control
+access and does not change ingestion. See [public site architecture, development
+and deployment](docs/public-site.md).
+
 ## What is collected, at what resolution
 
 Realtime feeds have independent monotonic schedules. Every request has its own
