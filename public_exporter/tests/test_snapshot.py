@@ -144,6 +144,19 @@ class PublicSnapshotTests(unittest.TestCase):
         self.assertEqual(health(self.root, NOW)["feeds"]["alerts"]["state"], "healthy")
         self.assertEqual(health(self.root, NOW + 181)["state"], "unknown")
 
+    def test_private_failure_names_still_project_generic_feed_failure(self):
+        atomic_write_json(self.root / "health/status.json", {
+            "updated_timestamp": NOW, "healthy": False,
+            "reasons": ["tripupdates:private-diagnostic/path?key=secret"],
+            "feeds": {"tripupdates": {"change_tracking_ok": False}},
+        })
+        result = health(self.root, NOW)
+        self.assertEqual(result["feeds"]["tripupdates"]["state"], "degraded")
+        self.assertEqual(result["feeds"]["tripupdates"]["issues"], ["change_tracker_failed"])
+        self.assertEqual(result["feeds"]["vehiclepositions"]["state"], "unknown")
+        self.assertNotIn("private-diagnostic", json.dumps(result))
+        self.assertNotIn("secret", json.dumps(result))
+
     def test_static_catalog_checks_hash_and_avoids_stop_times_and_rehashing(self):
         self.catalog()
         catalog = RouteCatalog(self.root / "static")

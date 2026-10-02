@@ -76,6 +76,8 @@ export function App() {
   const [enabled, setEnabled] = useState<Mode[]>([...modes])
   const state = effectiveState(snapshot, now)
   const publicCurrent = !!snapshot && (age(snapshot.generated_at, now) ?? Infinity) <= 90 && Date.parse(snapshot.generated_at) - now <= 30000
+  const mapAvailable = !!snapshot && snapshot.vehicles.observed_at !== null
+    && !snapshot.public_layer_issues.includes('vehicle_snapshot_unavailable')
   const counts = useMemo(() => Object.fromEntries(modes.map(mode => [mode, snapshot?.vehicles.features.filter(vehicle => vehicle.properties.mode === mode).length ?? 0])) as Record<Mode, number>, [snapshot])
   const visible = enabled.reduce((sum, mode) => sum + counts[mode], 0)
   const sourceAge = age(snapshot?.vehicles.observed_at ?? null, now)
@@ -91,8 +93,9 @@ export function App() {
       {(error || !publicCurrent) && <div className="public-banner" role="status">{snapshot ? 'Public updates are delayed. Showing the last received snapshot; current collector state may differ.' : error ? 'Public data is temporarily unavailable. The collector operates independently; this page will retry.' : 'Connecting to the public snapshot…'}</div>}
       <section className="live-section" id="live-map" aria-label="Live network">
         <div className="map-panel">
-          <div className="map-heading"><div><span className="eyebrow">The network, now</span><h2>{snapshot ? integer.format(visible) : '—'} <span>reported vehicles</span></h2></div><span className={`observation-label ${(sourceAge ?? Infinity) > 90 ? 'observation-stale' : ''}`}><i />{ageLabel(sourceAge)}<small>observation</small></span></div>
-          <div className="mode-filters" role="group" aria-label="Filter vehicles by transport mode">{modes.map(mode => <button key={mode} aria-pressed={enabled.includes(mode)} onClick={() => toggle(mode)} className={enabled.includes(mode) ? 'enabled' : ''}><i style={{ background: colors[mode] }} />{modeLabels[mode]}<span>{integer.format(counts[mode])}</span></button>)}</div>
+          <div className="map-heading"><div><span className="eyebrow">The network, now</span><h2>{mapAvailable ? integer.format(visible) : '—'} <span>reported vehicles</span></h2></div><span className={`observation-label ${(sourceAge ?? Infinity) > 90 ? 'observation-stale' : ''}`}><i />{ageLabel(sourceAge)}<small>observation</small></span></div>
+          <div className="mode-filters" role="group" aria-label="Filter vehicles by transport mode">{modes.map(mode => <button key={mode} disabled={!mapAvailable} aria-pressed={enabled.includes(mode)} onClick={() => toggle(mode)} className={enabled.includes(mode) ? 'enabled' : ''}><i style={{ background: colors[mode] }} />{modeLabels[mode]}<span>{mapAvailable ? integer.format(counts[mode]) : '—'}</span></button>)}</div>
+          {snapshot?.public_layer_issues.includes('route_catalog_unavailable') && <p className="projection-note">Static route metadata is unavailable. Positions remain visible with fallback labels.</p>}
           <MapBoundary><Suspense fallback={<div className="map-frame"><div className="map-loading"><span className="spinner" />Preparing the city map</div></div>}><TransitMap snapshot={snapshot} enabled={enabled} now={now} /></Suspense></MapBoundary>
           <div className="map-meta"><span>Positions from BKK GTFS-Realtime · refreshed independently</span><span>{snapshot?.vehicles.omitted_records ? `${snapshot.vehicles.omitted_records} records not plotted · ` : ''}No inferred movement or arrival promises</span></div>
         </div>

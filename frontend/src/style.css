@@ -44,6 +44,8 @@ h1 em { font-style: normal; font-weight: 420; color: #70869b; }
 .mode-filters button { display: flex; align-items: center; gap: 6px; border: 1px solid #e1e5eb; background: #f8f9fb; color: #778391; border-radius: 5px; font-size: 10px; white-space: nowrap; padding: 7px 8px; flex-shrink: 0; transition: background .15s; }
 .mode-filters button.enabled { background: #fff; color: #31475a; border-color: #cfd8e0; }
 .mode-filters button:hover { background: #f1f5f7; }
+.mode-filters button:disabled { cursor: default; opacity: .6; }
+.projection-note { margin: 0; padding: 0 24px 12px; font-size: 10px; line-height: 1.6; color: #88602b; }
 .mode-filters button i { width: 6px; height: 6px; border-radius: 50%; opacity: .4; }
 .mode-filters button.enabled i { opacity: 1; }
 .mode-filters button > span { font-size: 9px; color: #8897a4; font-variant-numeric: tabular-nums; }

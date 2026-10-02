@@ -36,6 +36,22 @@ test('unavailable public API is not portrayed as collector failure', async ({ pa
   await expect(page.getByText('Collection degraded')).not.toBeVisible()
 })
 
+test('missing map projection is not reported as an empty fleet', async ({ page }) => {
+  await page.route('**/api/snapshot', route => {
+    const snapshot = snapshotAt()
+    snapshot.vehicles = { type: 'FeatureCollection', observed_at: null, source_at: null,
+      records_in_source: 0, omitted_records: 0, features: [] }
+    snapshot.public_layer_issues = ['vehicle_snapshot_unavailable']
+    return route.fulfill({ json: snapshot })
+  })
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: '— reported vehicles' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '0 reported vehicles' })).not.toBeVisible()
+  await expect(page.getByText('Vehicle map snapshot unavailable · collection operates independently')).toBeVisible()
+  await expect(page.getByText('Collection operational', { exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Bus —', exact: true })).toBeDisabled()
+})
+
 test('stale generation and source remain clearly marked', async ({ page }) => {
   await page.route('**/api/snapshot', route => route.fulfill({ json: snapshotAt(Date.now() - 180000) }))
   await page.goto('/')

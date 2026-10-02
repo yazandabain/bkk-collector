@@ -60,6 +60,15 @@ def health(root: Path, now: float) -> dict[str, Any]:
     for name in FEEDS:
         source = status.get("feeds", {}).get(name, {})
         flags = set(source.get("freshness_flags", []))
+        # Private diagnostic names can evolve. Explicit failure booleans still
+        # map to closed public codes instead of making a failed feed look healthy.
+        for field, code in {
+            "parse_ok": "protobuf_parse_failed", "raw_ok": "raw_archive_failed",
+            "spool_ok": "derived_spool_failed", "presence_ok": "tripupdates_presence_failed",
+            "change_tracking_ok": "change_tracker_failed", "poll_journal_ok": "poll_journal_failed",
+        }.items():
+            if source.get(field) is False:
+                flags.add(code)
         for item in status.get("reasons", []) + status.get("warnings", []):
             if isinstance(item, str) and item.startswith(name + ":"):
                 flags.add(item.partition(":")[2])
@@ -67,7 +76,7 @@ def health(root: Path, now: float) -> dict[str, Any]:
         cadence = source.get("scheduler", {}).get("interval_seconds")
         cadence = cadence if type(cadence) in (int, float) and 5 <= cadence <= 3600 else None
         feeds[name] = {
-            "state": "unknown" if not current else "degraded" if any(not code.endswith("_warning") and code not in
+            "state": "unknown" if not current or not source else "degraded" if any(not code.endswith("_warning") and code not in
                         {"request_exceeds_cadence", "scheduler_missed_deadline"} for code in codes) else "healthy",
             "observed_at": iso(source.get("last_success_timestamp")),
             "source_at": iso(source.get("header_timestamp")),

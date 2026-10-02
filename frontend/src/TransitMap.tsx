@@ -17,6 +17,8 @@ export function TransitMap({ snapshot, enabled, now }: { snapshot: Snapshot | nu
   const [unavailable, setUnavailable] = useState(false)
   const [selected, setSelected] = useState<Vehicle | null>(null)
   const [tileError, setTileError] = useState(false)
+  const missingSnapshot = !!snapshot && (snapshot.vehicles.observed_at === null
+    || snapshot.public_layer_issues.includes('vehicle_snapshot_unavailable'))
   useEffect(() => {
     if (!container.current) return
     let map: Map
@@ -62,11 +64,11 @@ export function TransitMap({ snapshot, enabled, now }: { snapshot: Snapshot | nu
     if (!map || !ready) return
     // GeoJSON tiling may omit string top-level IDs. Keep our opaque public ID
     // as a promoted property so selection survives tiling and later refreshes.
-    const features = snapshot?.vehicles.features.filter(vehicle => enabled.includes(vehicle.properties.mode))
+    const features = (missingSnapshot ? [] : snapshot?.vehicles.features)?.filter(vehicle => enabled.includes(vehicle.properties.mode))
       .map(vehicle => ({ ...vehicle, properties: { ...vehicle.properties, public_id: vehicle.id } })) ?? []
     ;(map.getSource('vehicles') as GeoJSONSource).setData({ type: 'FeatureCollection', features })
     if (selected && !features.some(vehicle => vehicle.id === selected.id)) setSelected(null)
-  }, [snapshot, enabled, ready, selected])
+  }, [snapshot, enabled, ready, selected, missingSnapshot])
   const selectedCurrent = selected ? snapshot?.vehicles.features.find(vehicle => vehicle.id === selected.id) ?? selected : null
   const stale = (age(snapshot?.vehicles.observed_at ?? null, now) ?? Infinity) > 90
     || (age(snapshot?.generated_at ?? null, now) ?? Infinity) > 90
@@ -75,7 +77,7 @@ export function TransitMap({ snapshot, enabled, now }: { snapshot: Snapshot | nu
     <div ref={container} className="map" role="region" aria-label="Interactive Budapest vehicle map" />
     {!ready && !unavailable && <div className="map-loading"><span className="spinner" />Preparing the city map</div>}
     {unavailable && <div className="map-loading"><strong>Map rendering is unavailable</strong><p>Your browser may not support WebGL. Live counts and feed health remain available below.</p></div>}
-    {ready && (stale || !snapshot) && <div className="map-notice">{snapshot ? 'Last reported positions · source or public updates are stale' : 'Waiting for the first public snapshot'}</div>}
+    {ready && (stale || !snapshot || missingSnapshot) && <div className="map-notice">{missingSnapshot ? 'Vehicle map snapshot unavailable · collection operates independently' : snapshot ? 'Last reported positions · source or public updates are stale' : 'Waiting for the first public snapshot'}</div>}
     {tileError && ready && <div className="map-tile-warning">Some basemap tiles are unavailable</div>}
     {ready && <button className="map-reset" onClick={() => instance.current?.easeTo({ center: [19.065, 47.493], zoom: 11.1, duration: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 500 })} aria-label="Reset map to Budapest"><svg width="15" height="15" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="5" fill="none" stroke="currentColor" strokeWidth="1.4" /><path d="M10 1v5m0 8v5M1 10h5m8 0h5" stroke="currentColor" strokeWidth="1.4" /></svg><span>Budapest</span></button>}
     {selectedCurrent && <div className="vehicle-detail">
