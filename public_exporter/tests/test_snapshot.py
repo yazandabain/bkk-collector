@@ -2,6 +2,7 @@ import gzip
 import hashlib
 import json
 import tempfile
+import tracemalloc
 import unittest
 import zipfile
 from datetime import date, datetime, timezone
@@ -184,6 +185,22 @@ class PublicSnapshotTests(unittest.TestCase):
             publish(session, "https://example.invalid/api/publish", "secret", {"schema_version": 1})
         self.assertEqual(session.put.call_args.kwargs["timeout"], (3, 7))
         self.assertFalse(session.put.call_args.kwargs["allow_redirects"])
+
+    def test_statistics_memory_does_not_accumulate_private_artifact_lists(self):
+        for day in range(1, 31):
+            atomic_write_json(self.root / f"manifests/date=2026-09-{day:02d}.json", {})
+        def load(path):
+            return {"date": path.stem.removeprefix("date="), "feeds": {name: {"attempted_polls": 1} for name in FEEDS},
+                    "artifacts": [{"irrelevant_metadata": "x" * 1024 * 1024}]}
+        tracemalloc.start()
+        try:
+            with patch("public_exporter.snapshot.load_optional", side_effect=load):
+                result = statistics(self.root, NOW)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(result["evidenced_days"], 30)
+        self.assertLess(peak, 8 * 1024 * 1024)
 
 
 if __name__ == "__main__":

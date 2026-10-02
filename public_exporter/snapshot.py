@@ -99,36 +99,43 @@ def valid_date(value: Any) -> bool:
 
 def statistics(root: Path, now: float) -> dict[str, Any]:
     today = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
-    days = []
+    evidenced_days = polls = event_rows = raw_snapshots = 0
+    earliest = None
+    latest = None
     for path in sorted((root / "manifests").glob("date=*.json")):
         manifest = load_optional(path)
         date = manifest.get("date")
         feeds = manifest.get("feeds", {})
         if valid_date(date) and date < today and any((count(feeds.get(name, {}).get("attempted_polls")) or 0) > 0 for name in FEEDS):
-            days.append(manifest)
-    starts = [stamp for day in days for name in FEEDS
-              if (stamp := safe_iso(day["feeds"].get(name, {}).get("first_success_at")))]
+            evidenced_days += 1
+            for name in FEEDS:
+                source = feeds.get(name, {})
+                stamp = safe_iso(source.get("first_success_at"))
+                if stamp and (earliest is None or stamp < earliest):
+                    earliest = stamp
+                polls += count(source.get("attempted_polls")) or 0
+                event_rows += count(source.get("parquet_rows")) or 0
+                raw_snapshots += count(source.get("raw_snapshots")) or 0
+            # Retain only the public projection, never months of artifact lists.
+            if latest is None or date > latest["date"]:
+                latest = {
+                    "date": date, "quality": "good" if manifest.get("quality_ok") is True else "flagged",
+                    "feeds": {name: {
+                        "expected_polls": count(feeds.get(name, {}).get("expected_polls")),
+                        "recorded_polls": count(feeds.get(name, {}).get("attempted_polls")),
+                        "data_polls": count(feeds.get(name, {}).get("successful_data_polls")),
+                    } for name in FEEDS},
+                }
     verified_dates = []
     for path in (root / "receipts").glob("date=*.json"):
         receipt = load_optional(path)
         if (receipt.get("version") == 2 and receipt.get("remote_verified") is True and valid_date(receipt.get("date"))
                 and path.name == f"date={receipt['date']}.json" and receipt["date"] < today):
             verified_dates.append(receipt["date"])
-    latest = days[-1] if days else None
     return {
-        "as_of": iso(now), "evidenced_since": min(starts, default=None), "evidenced_days": len(days),
+        "as_of": iso(now), "evidenced_since": earliest, "evidenced_days": evidenced_days,
         "verified_days": len(verified_dates), "last_verified_date": max(verified_dates, default=None),
-        "polls_recorded": sum(count(day["feeds"].get(name, {}).get("attempted_polls")) or 0 for day in days for name in FEEDS),
-        "event_rows": sum(count(day["feeds"].get(name, {}).get("parquet_rows")) or 0 for day in days for name in FEEDS),
-        "raw_snapshots": sum(count(day["feeds"].get(name, {}).get("raw_snapshots")) or 0 for day in days for name in FEEDS),
-        "latest_day": None if latest is None else {
-            "date": latest["date"], "quality": "good" if latest.get("quality_ok") is True else "flagged",
-            "feeds": {name: {
-                "expected_polls": count(latest["feeds"].get(name, {}).get("expected_polls")),
-                "recorded_polls": count(latest["feeds"].get(name, {}).get("attempted_polls")),
-                "data_polls": count(latest["feeds"].get(name, {}).get("successful_data_polls")),
-            } for name in FEEDS},
-        },
+        "polls_recorded": polls, "event_rows": event_rows, "raw_snapshots": raw_snapshots, "latest_day": latest,
     }
 
 
