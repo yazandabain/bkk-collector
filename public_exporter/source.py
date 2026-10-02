@@ -110,7 +110,7 @@ def mode_for(route_type: str) -> str:
         return "tram"
     if route_type in {"1", "400", "401", "402"}:
         return "metro"
-    if route_type == "800":
+    if route_type in {"11", "800"}:
         return "trolleybus"
     if route_type == "3" or route_type.startswith("7"):
         return "bus"

@@ -160,7 +160,7 @@ class PublicSnapshotTests(unittest.TestCase):
         atomic_write_json(self.root / "static/state.json", {"latest_sha256": "a" * 64, "latest_version_path": "../private.zip"})
         with self.assertRaises(ValueError):
             RouteCatalog(self.root / "static").read()
-        self.assertEqual([mode_for(value) for value in ("109", "800", "1000", "3", "1")], ["rail", "trolleybus", "ferry", "bus", "metro"])
+        self.assertEqual([mode_for(value) for value in ("109", "800", "11", "1000", "3", "1")], ["rail", "trolleybus", "trolleybus", "ferry", "bus", "metro"])
 
     def test_statistics_do_not_call_missing_legacy_evidence_uptime_or_complete(self):
         feeds = {name: {"attempted_polls": 10, "expected_polls": 20, "raw_snapshots": 2, "parquet_rows": 100,
