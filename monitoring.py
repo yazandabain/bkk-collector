@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import Any
 
 import realcity
-from atomic_io import append_jsonl, atomic_write_json, read_json
+from atomic_io import atomic_write_json, read_json
 from config import FEED_NAMES
+from poll_journal import append_poll_jsonl
 
 
 def utc_iso(timestamp: float | None = None) -> str:
@@ -103,6 +104,8 @@ class HealthMonitor:
         min_entity_timestamp: int | None,
         max_entity_timestamp: int | None,
         parse_ok: bool,
+        presence_ok: bool = True,
+        presence_details: dict[str, Any] | None = None,
         change_tracking_ok: bool = True,
         change_tracking_failure_flag: str | None = None,
         raw_ok: bool,
@@ -161,6 +164,8 @@ class HealthMonitor:
             flags.append("raw_archive_failed")
         if not spool_ok:
             flags.append("derived_spool_failed")
+        if not presence_ok:
+            flags.append("tripupdates_presence_failed")
         state.update(
             {
                 "last_success_at": utc_iso(now_ts),
@@ -179,6 +184,8 @@ class HealthMonitor:
                 "entity_count": entity_count,
                 "consecutive_failures": 0,
                 "parse_ok": parse_ok,
+                "presence_ok": presence_ok,
+                "presence": presence_details or {},
                 "change_tracking_ok": change_tracking_ok,
                 "change_tracking_failure_flag": change_tracking_failure_flag,
                 "raw_ok": raw_ok,
@@ -212,6 +219,7 @@ class HealthMonitor:
         parquet_flush_errors: list[str],
         cycle_errors: list[str],
         scheduler: dict[str, dict[str, Any]] | None = None,
+        parquet_worker: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         reasons: list[str] = []
         warnings: list[str] = []
@@ -229,6 +237,8 @@ class HealthMonitor:
                 reasons.append(f"{feed_name}:absent")
             if int(state.get("consecutive_failures", 0)):
                 reasons.append(f"{feed_name}:http_failed")
+            if state.get("poll_journal_ok") is False:
+                reasons.append(f"{feed_name}:poll_journal_failed")
             for flag in state.get("freshness_flags", []):
                 target = warnings if flag.endswith("_warning") else reasons
                 target.append(f"{feed_name}:{flag}")
@@ -243,7 +253,8 @@ class HealthMonitor:
                 ):
                     reasons.append(f"{feed_name}:request_stuck")
                 missed = int(schedule.get("missed_since_last_request") or 0)
-                if missed:
+                recent_miss_age = schedule.get("seconds_since_missed_deadline")
+                if missed or (recent_miss_age is not None and recent_miss_age < 300):
                     warnings.append(f"{feed_name}:scheduler_missed_deadline")
                 next_due = schedule.get("next_deadline_in_seconds")
                 if next_due is not None and interval and float(next_due) < -interval:
@@ -258,6 +269,11 @@ class HealthMonitor:
             reasons.append("parquet_flush_failed")
         if cycle_errors:
             reasons.append("cycle_storage_error")
+        if parquet_worker is not None:
+            if not parquet_worker.get("alive"):
+                reasons.append("parquet_worker_stopped")
+            if parquet_worker.get("active_seconds", 0) > 600:
+                reasons.append("parquet_worker_stuck")
         status = {
             "version": 1,
             "updated_at": utc_iso(now_ts),
@@ -271,6 +287,7 @@ class HealthMonitor:
             "disk_critical_bytes": disk_critical_bytes,
             "pending_spool_segments": pending_spool_segments,
             "parquet_flush_errors": parquet_flush_errors,
+            "parquet_worker": parquet_worker,
             "cycle_errors": cycle_errors,
             "scheduler": scheduler or {},
             "feeds": feed_status,
@@ -283,8 +300,15 @@ def poll_journal_path(data_dir: Path, feed_name: str, date_str: str) -> Path:
     return data_dir / "metadata" / "polls" / feed_name / f"date={date_str}" / "polls.jsonl"
 
 
+def data_poll_success(event: dict[str, Any]) -> bool:
+    """All normal-path evidence succeeded; raw fallback is counted separately."""
+    return bool(event.get("success") and event.get("parse_ok") and all(
+        event.get(field, True) is not False for field in ("raw_ok", "spool_ok", "change_tracking_ok")
+    ) and (not event.get("presence_required") or event.get("presence_ok") is True))
+
+
 def append_poll_event(data_dir: Path, feed_name: str, date_str: str, event: dict[str, Any]) -> None:
-    append_jsonl(poll_journal_path(data_dir, feed_name, date_str), event, fsync=True)
+    append_poll_jsonl(poll_journal_path(data_dir, feed_name, date_str), event)
 
 
 def iter_jsonl(path: Path):

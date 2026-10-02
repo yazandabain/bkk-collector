@@ -11,7 +11,7 @@ import uuid
 from itertools import islice
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from atomic_io import atomic_write_bytes, atomic_write_json, fsync_directory, read_json
 from config import FEED_NAMES
@@ -288,7 +288,7 @@ class DurableParquetSpool:
         result.files_written.append(out_path)
         result.rows_written += expected_rows
 
-    def flush(self, *, force: bool = False) -> FlushResult:
+    def flush(self, *, force: bool = False, should_stop: Callable[[], bool] = lambda: False) -> FlushResult:
         result = FlushResult()
         blocked = self._recover_commits(result)
         if not force and time.monotonic() - self._last_flush < self.flush_seconds:
@@ -298,6 +298,8 @@ class DurableParquetSpool:
             if (feed_name, date_str) in blocked:
                 continue
             for start in range(0, len(segments), MAX_SEGMENTS_PER_COMMIT):
+                if should_stop():
+                    return result
                 batch = segments[start : start + MAX_SEGMENTS_PER_COMMIT]
                 try:
                     self._commit_segments(feed_name, date_str, batch, result)
