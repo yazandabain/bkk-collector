@@ -14,7 +14,7 @@ services:
     cpus: 0.25
     pids_limit: 32
     stop_grace_period: 20s
-    tmpfs: [/tmp:size=16m,mode=1777]
+    tmpfs: ["/tmp:size=16m,mode=1777"]
     volumes:
       - ./data/raw/vehiclepositions:/input/raw:ro
       - ./data/health:/input/health:ro

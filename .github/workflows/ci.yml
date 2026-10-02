@@ -21,6 +21,8 @@ jobs:
       - run: python -m unittest discover -s public_exporter/tests -v
       - run: docker build -f Dockerfile.public -t bkk-public-exporter:ci .
       - run: docker run --rm --network none bkk-public-exporter:ci python -m public_exporter --help
+      - run: cp .env.public.example .env.public
+      - run: docker compose -f docker-compose.public.yml run --build --rm --no-deps public-exporter python -m public_exporter --help
 
   frontend:
     runs-on: ubuntu-latest
