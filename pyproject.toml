@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bkk-collector"
+description = "Durable Budapest GTFS-Realtime collection and archive tools"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dynamic = ["version", "dependencies"]
+
+[project.urls]
+Repository = "https://github.com/yazandabain/bkk-collector"
+
+[project.scripts]
+bkk-collector = "bkk_collector.collector:entrypoint"
+bkk-maintenance = "bkk_collector.maintenance:entrypoint"
+bkk-healthcheck = "bkk_collector.cli.healthcheck:main"
+bkk-maintenance-healthcheck = "bkk_collector.cli.maintenance_healthcheck:main"
+bkk-diagnostics = "bkk_collector.cli.diagnostics:main"
+bkk-rebuild-parquet = "bkk_collector.cli.rebuild_parquet:main"
+bkk-check-threshold = "bkk_collector.cli.check_threshold:main"
+bkk-verify-backup = "bkk_collector.cli.verify_backup:main"
+bkk-migrate-legacy = "bkk_collector.cli.migrate_legacy:main"
+
+[tool.setuptools]
+py-modules = []
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["bkk_collector", "bkk_collector.*"]
+namespaces = false
+
+[tool.setuptools.dynamic]
+version = {attr = "bkk_collector.__version__"}
+dependencies = {file = ["requirements.txt"]}

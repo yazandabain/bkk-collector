@@ -19,6 +19,17 @@ jobs:
       - run: python -m compileall -q .
       - run: python -m unittest discover -s tests -v
       - run: python -m unittest discover -s public_exporter/tests -v
+      - run: python -m pip wheel --no-deps . --wheel-dir /tmp/bkk-wheels
+      - run: python -m pip install --no-deps /tmp/bkk-wheels/*.whl
+      - name: Verify installed package outside the checkout
+        working-directory: /tmp
+        run: |
+          python -I -c 'import bkk_collector; from importlib.metadata import version; from bkk_collector.collector import Collector; from bkk_collector.archive.backup import BackupManager; assert version("bkk-collector") == bkk_collector.__version__'
+          bkk-diagnostics --help
+          bkk-rebuild-parquet --help
+          python -m pip check
+      - run: docker build -t bkk-collector:ci .
+      - run: docker run --rm --network none --memory 1536m bkk-collector:ci python -m unittest discover -s tests -v
       - run: docker build -f Dockerfile.public -t bkk-public-exporter:ci .
       - run: docker run --rm --network none bkk-public-exporter:ci python -m public_exporter --help
       - run: cp .env.public.example .env.public
