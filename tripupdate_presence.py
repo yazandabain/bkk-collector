@@ -17,6 +17,7 @@ from trip_update_policy import TRIP_UPDATE_KEY_FIELDS
 
 
 PRESENCE_VERSION = 1
+SOURCE_TIMESTAMPS_VERSION = 1
 TRIP_IDENTITY_FIELDS = TRIP_UPDATE_KEY_FIELDS[:4]
 STOP_IDENTITY_FIELDS = TRIP_UPDATE_KEY_FIELDS[4:]
 
@@ -69,6 +70,39 @@ def apply_presence_record(members: dict[tuple, set[tuple]], record: dict) -> dic
     return members
 
 
+def apply_source_timestamp_record(timestamps: dict[tuple, int | None] | None,
+                                  record: dict, members: dict[tuple, set[tuple]]) -> dict | None:
+    """Replay optional per-trip provenance, never invent it for older records.
+
+    Source timestamps are not ETA changes or observed arrivals. BKK can revise
+    them without changing predictions, so they belong here rather than in the
+    row ChangeTracker. Old v1 membership records remain fully readable.
+    """
+    version = record.get("source_timestamps_version")
+    if version is None:
+        return None
+    if version != SOURCE_TIMESTAMPS_VERSION:
+        raise ValueError("unsupported source timestamp evidence")
+    if record["kind"] == "baseline":
+        timestamps = {}
+    elif timestamps is None:
+        raise ValueError("source timestamps have no preceding baseline")
+    for change in record["changes"]:
+        if change["trip_withdrawn"]:
+            timestamps.pop(tuple(change["trip"]), None)
+    seen = set()
+    for update in record["source_timestamp_updates"]:
+        trip, timestamp = tuple(update["trip"]), update["timestamp"]
+        if (trip not in members or trip in seen
+                or (timestamp is not None and (type(timestamp) is not int or timestamp < 0))):
+            raise ValueError("invalid/duplicate source timestamp update")
+        seen.add(trip)
+        timestamps[trip] = timestamp
+    if timestamps.keys() != members.keys():
+        raise ValueError("source timestamps do not cover observed membership")
+    return timestamps
+
+
 def _ordered(values):
     return sorted(values, key=lambda value: json.dumps(value, separators=(",", ":")))
 
@@ -81,6 +115,7 @@ class TripUpdatePresence:
         self.run_id = run_id
         self._date: str | None = None
         self._members: dict[tuple, set[tuple]] | None = None
+        self._source_timestamps: dict[tuple, int | None] = {}
         self._baseline_reason = "process_start"
         self._stream_id = uuid.uuid4().hex
         self._sequence = 0
@@ -99,18 +134,21 @@ class TripUpdatePresence:
             self._date = date
             self._members = None
         current: dict[tuple, set[tuple]] = {}
+        source_timestamps: dict[tuple, int | None] = {}
         for row in rows:
             if row.get("entity_is_deleted"):
                 self.invalidate("unexpected_deletion")
                 raise ValueError("FULL_DATASET deletion cannot be interpreted as presence")
             trip = tuple(row.get(field) for field in TRIP_IDENTITY_FIELDS)
             stops = current.setdefault(trip, set())
+            source_timestamps[trip] = row.get("trip_update_timestamp")
             # Trip-only/canceled entities remain present, with no invented stop.
             if row.get("stop_time_update_index") is not None:
                 stops.add(tuple(row.get(field) for field in STOP_IDENTITY_FIELDS))
         baseline = self._members is None
         previous = self._members or {}
         changes = []
+        timestamp_updates = []
         for trip in _ordered(current.keys() | previous.keys()):
             old_stops = previous.get(trip, set())
             new_stops = current.get(trip, set())
@@ -118,6 +156,9 @@ class TripUpdatePresence:
             withdrawn = old_stops - new_stops
             trip_entered = trip not in previous
             trip_withdrawn = trip not in current
+            if trip in current and (baseline or trip_entered
+                                    or source_timestamps[trip] != self._source_timestamps.get(trip)):
+                timestamp_updates.append({"trip": trip, "timestamp": source_timestamps[trip]})
             if entered or withdrawn or trip_entered or trip_withdrawn:
                 changes.append({
                     "trip": trip, "trip_entered": trip_entered, "trip_withdrawn": trip_withdrawn,
@@ -134,6 +175,8 @@ class TripUpdatePresence:
             "stop_identity_fields": STOP_IDENTITY_FIELDS,
             "trip_count": len(current), "stop_count": sum(map(len, current.values())),
             "changes": changes,
+            "source_timestamps_version": SOURCE_TIMESTAMPS_VERSION,
+            "source_timestamp_updates": timestamp_updates,
         }
         path = presence_path(self.data_dir, date)
         try:
@@ -145,9 +188,11 @@ class TripUpdatePresence:
             self.invalidate("presence_write_gap")
             raise
         self._members = current
+        self._source_timestamps = source_timestamps
         self._stream_id = stream_id
         self._sequence = sequence
         return {"presence_path": str(path.relative_to(self.data_dir)),
                 "presence_kind": record["kind"], "presence_stream_id": stream_id,
                 "presence_sequence": sequence, "present_trips": record["trip_count"],
-                "present_stop_visits": record["stop_count"]}
+                "present_stop_visits": record["stop_count"],
+                "presence_source_timestamps_version": SOURCE_TIMESTAMPS_VERSION}

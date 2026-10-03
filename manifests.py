@@ -15,7 +15,7 @@ from monitoring import data_poll_success, iter_jsonl, parse_iso_timestamp, poll_
 from parquet_store import ensure_empty_parquet, parquet_row_count
 from raw_log import scan_raw_log
 from static_gtfs import StaticGtfsStore
-from tripupdate_presence import apply_presence_record, iter_presence, presence_path
+from tripupdate_presence import apply_presence_record, apply_source_timestamp_record, iter_presence, presence_path
 
 
 def _artifact(data_dir: Path, path: Path, kind: str) -> dict[str, Any]:
@@ -57,6 +57,8 @@ def _presence_stats(data_dir: Path, date: str, events: list[dict]) -> tuple[dict
     count, baselines = 0, 0
     seen: dict[str, tuple[str, int]] = {}
     members = {}
+    source_timestamps = None
+    source_timestamp_observations = 0
     stream = None
     sequence = 0
     if path.exists():
@@ -72,6 +74,13 @@ def _presence_stats(data_dir: Path, date: str, events: list[dict]) -> tuple[dict
                 if record["stream_id"] != stream or record["sequence"] != sequence + 1:
                     raise ValueError("presence stream has a sequence gap")
                 members = apply_presence_record(members, record)
+                source_timestamps = apply_source_timestamp_record(source_timestamps, record, members)
+                if source_timestamps is not None:
+                    source_timestamp_observations += 1
+                promised_event = promised.get(record["poll_id"], {})
+                if (promised_event.get("presence_source_timestamps_version") is not None
+                        and promised_event["presence_source_timestamps_version"] != record.get("source_timestamps_version")):
+                    raise ValueError("journal-promised source timestamp evidence is missing/mismatched")
                 sequence = record["sequence"]
                 poll_id = record["poll_id"]
                 if poll_id in seen:
@@ -94,6 +103,7 @@ def _presence_stats(data_dir: Path, date: str, events: list[dict]) -> tuple[dict
     return {"expected_observations": expected, "journal_confirmed_observations": len(promised),
             "records": count, "baselines": baselines,
             "legacy_pre_presence_polls": legacy_polls,
+            "source_timestamp_observations": source_timestamp_observations,
             "unavailable_observations": unavailable}, errors, quality
 
 
