@@ -12,14 +12,14 @@ from unittest.mock import Mock, patch
 
 import pyarrow.parquet as pq
 
-from atomic_io import atomic_write_json, read_json, sha256_file
-from config import FEED_NAMES, MaintenanceConfig
-from dedup import ChangeTracker
-from maintenance import MaintenanceWorker
-from manifests import _feed_stats
-from atomic_io import append_jsonl
-from monitoring import HealthMonitor
-from parquet_store import DurableParquetSpool, PARQUET_WRITE_BATCH_ROWS, write_parquet_atomic
+from bkk_collector.storage.atomic_io import atomic_write_json, read_json, sha256_file
+from bkk_collector.config import FEED_NAMES, MaintenanceConfig
+from bkk_collector.realtime.dedup import ChangeTracker
+from bkk_collector.maintenance import MaintenanceWorker
+from bkk_collector.archive.manifests import _feed_stats
+from bkk_collector.storage.atomic_io import append_jsonl
+from bkk_collector.monitoring import HealthMonitor
+from bkk_collector.storage.parquet_store import DurableParquetSpool, PARQUET_WRITE_BATCH_ROWS, write_parquet_atomic
 from tests import test_reliability as reliability
 from verify_backup import restore_artifact
 
@@ -66,7 +66,7 @@ class RetentionTests(unittest.TestCase):
             # Freeze only the retention calendar; file hashes and remote checks
             # remain real. Existing fixture date becomes today or recent.
             now = datetime.strptime(self.date, '%Y-%m-%d').replace(tzinfo=timezone.utc) + timedelta(days=offset)
-            with patch('retention.datetime') as clock:
+            with patch('bkk_collector.archive.retention.datetime') as clock:
                 clock.now.return_value = now
                 clock.strptime.side_effect = datetime.strptime
                 self.refuse()
@@ -179,7 +179,7 @@ class RetentionTests(unittest.TestCase):
 
     def test_prune_intent_write_failure_deletes_nothing(self):
         self.ready()
-        with patch('retention.atomic_write_json',side_effect=OSError('full')):
+        with patch('bkk_collector.archive.retention.atomic_write_json',side_effect=OSError('full')):
             self.refuse()
 
     def test_interrupted_unlink_resumes_with_verified_intent(self):
@@ -286,12 +286,12 @@ class MemoryAndHealthTests(unittest.TestCase):
         self.assertLessEqual(len(tracker._last),6000)
 
     def test_parquet_writer_bounds_arrow_batch_size_and_preserves_all_rows(self):
-        import parquet_store
+        from bkk_collector.storage import parquet_store
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/'data.parquet';seen=[];original=parquet_store.rows_to_table
             def table(feed,rows):
                 seen.append(len(rows));return original(feed,rows)
-            with patch('parquet_store.rows_to_table',side_effect=table):
+            with patch('bkk_collector.storage.parquet_store.rows_to_table',side_effect=table):
                 write_parquet_atomic('alerts',({'entity_id':str(i)} for i in range(10001)),path)
             self.assertLessEqual(max(seen),PARQUET_WRITE_BATCH_ROWS)
             self.assertEqual(10001,pq.ParquetFile(path).metadata.num_rows)

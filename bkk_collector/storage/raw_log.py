@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Iterator, Tuple
 
-from atomic_io import atomic_write_json, fsync_directory, read_json
+from bkk_collector.storage.atomic_io import atomic_write_json, fsync_directory, read_json
 
 _HEADER = struct.Struct(">dI")  # timestamp (float64), length (uint32)
 MAX_COMPRESSED_RECORD_BYTES = 256 * 1024 * 1024

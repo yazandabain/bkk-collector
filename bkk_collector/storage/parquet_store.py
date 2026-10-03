@@ -13,8 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from atomic_io import atomic_write_bytes, atomic_write_json, fsync_directory, read_json
-from config import FEED_NAMES
+from bkk_collector.storage.atomic_io import atomic_write_bytes, atomic_write_json, fsync_directory, read_json
+from bkk_collector.config import FEED_NAMES
 
 
 COMMON_COLUMNS = (

@@ -15,24 +15,24 @@ from unittest.mock import Mock, patch
 from google.transit import gtfs_realtime_pb2 as pb
 from urllib3.exceptions import NewConnectionError
 
-import collector as collector_module
+from bkk_collector import collector as collector_module
 import rebuild_parquet
-from atomic_io import atomic_write_json, fsync_directory, read_json, sha256_file
-from backup import BackupManager
-from collector import Collector, FetchResult, _new_session
-from config import CollectorConfig, FEED_NAMES
+from bkk_collector.storage.atomic_io import atomic_write_json, fsync_directory, read_json, sha256_file
+from bkk_collector.archive.backup import BackupManager
+from bkk_collector.collector import Collector, FetchResult, _new_session
+from bkk_collector.config import CollectorConfig, FEED_NAMES
 from diagnostics import collection_window_report, main as diagnostics_main
-from gtfs_rt_parse import parse_trip_updates
-from manifests import _feed_stats, _presence_stats, build_daily_manifest
-from monitoring import HealthMonitor, append_poll_event, poll_journal_path, utc_iso
-from parquet_store import DurableParquetSpool, MAX_SEGMENTS_PER_COMMIT, parquet_row_count, write_parquet_atomic
-from parquet_worker import ParquetCommitWorker
-from poll_journal import append_poll_jsonl, recent_partition_files, repair_jsonl_tail
-from raw_log import MAX_COMPRESSED_RECORD_BYTES, append_record, iter_records, repair_truncated_tail, scan_raw_log
-from realtime_scheduler import IndependentFeedScheduler
-from static_gtfs import StaticGtfsStore
+from bkk_collector.realtime.gtfs_rt_parse import parse_trip_updates
+from bkk_collector.archive.manifests import _feed_stats, _presence_stats, build_daily_manifest
+from bkk_collector.monitoring import HealthMonitor, append_poll_event, poll_journal_path, utc_iso
+from bkk_collector.storage.parquet_store import DurableParquetSpool, MAX_SEGMENTS_PER_COMMIT, parquet_row_count, write_parquet_atomic
+from bkk_collector.storage.parquet_worker import ParquetCommitWorker
+from bkk_collector.storage.poll_journal import append_poll_jsonl, recent_partition_files, repair_jsonl_tail
+from bkk_collector.storage.raw_log import MAX_COMPRESSED_RECORD_BYTES, append_record, iter_records, repair_truncated_tail, scan_raw_log
+from bkk_collector.realtime.realtime_scheduler import IndependentFeedScheduler
+from bkk_collector.archive.static_gtfs import StaticGtfsStore
 from tests.test_reliability import FakeBackupApi, StaticSession, gtfs_zip_bytes
-from tripupdate_presence import TripUpdatePresence, apply_presence_record, iter_presence, presence_path
+from bkk_collector.realtime.tripupdate_presence import TripUpdatePresence, apply_presence_record, iter_presence, presence_path
 from verify_backup import verify_day
 
 
@@ -163,9 +163,9 @@ class ParquetIsolationTests(ReadinessFixture):
                 failures.append(error)
 
         with patch.object(collector_module, "_shutdown_requested", False), \
-                patch("collector.IndependentFeedScheduler", side_effect=scheduler_factory), \
+                patch("bkk_collector.collector.IndependentFeedScheduler", side_effect=scheduler_factory), \
                 patch.object(value, "fetch_feed", side_effect=fetch), \
-                patch("parquet_store.write_parquet_atomic", side_effect=gated_write):
+                patch("bkk_collector.storage.parquet_store.write_parquet_atomic", side_effect=gated_write):
             thread = threading.Thread(target=run, name="test-ingestion")
             thread.start()
             try:
@@ -203,7 +203,7 @@ class ParquetIsolationTests(ReadinessFixture):
         spool = DurableParquetSpool(self.data, flush_seconds=300)
         source = spool.stage("alerts", self.date, "poll", [{"entity_id": "recover"}])
         worker = ParquetCommitWorker(spool, logging.getLogger("test-parquet"))
-        with patch("parquet_store.write_parquet_atomic", side_effect=OSError("disk full")):
+        with patch("bkk_collector.storage.parquet_store.write_parquet_atomic", side_effect=OSError("disk full")):
             worker.start()
             try:
                 wait_until(lambda: bool(worker.snapshot()["errors"]))
@@ -405,7 +405,7 @@ class PresenceTests(ReadinessFixture):
     def test_failed_presence_append_never_advances_delta_state(self):
         value = TripUpdatePresence(self.data, "run")
         value.observe(self.rows(), self.date, self.now, self.context("one"))
-        with patch("tripupdate_presence.append_record", side_effect=OSError("disk full")):
+        with patch("bkk_collector.realtime.tripupdate_presence.append_record", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 value.observe([], self.date, self.now + 10, self.context("lost"))
         value.observe(self.rows(), self.date, self.now + 20, self.context("recovered"))
@@ -416,7 +416,7 @@ class PresenceTests(ReadinessFixture):
     def test_presence_failure_forces_raw_between_normal_snapshots_and_unhealthy(self):
         value = self.collector()
         value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), "first", self.now), [])
-        with patch("tripupdate_presence.append_record", side_effect=OSError("disk full")):
+        with patch("bkk_collector.realtime.tripupdate_presence.append_record", side_effect=OSError("disk full")):
             value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), "second", self.now + 10), [])
         raw = self.data / "raw" / "tripupdates" / f"date={self.date}" / "tripupdates.rawlog"
         self.assertEqual(2, scan_raw_log(raw).complete_records)
@@ -513,7 +513,7 @@ class ForensicDurabilityTests(ReadinessFixture):
                     self.assertEqual(tail, copies[0].read_bytes())
                     fsync_directory(directory, strict=strict)
 
-                with patch("raw_log.fsync_directory", side_effect=sync) as directory_sync:
+                with patch("bkk_collector.storage.raw_log.fsync_directory", side_effect=sync) as directory_sync:
                     recovery = repair_truncated_tail(path)
                 directory_sync.assert_called_once_with(path.parent, strict=True)
                 self.assertEqual(prefix, path.read_bytes())
@@ -526,7 +526,7 @@ class ForensicDurabilityTests(ReadinessFixture):
                 path, prefix, tail = self.raw_fixture(name)
                 checkpoint = path.with_name(path.name + ".checkpoint.json")
                 original_checkpoint = checkpoint.read_bytes()
-                with patch("raw_log.fsync_directory", side_effect=OSError("directory sync failed")):
+                with patch("bkk_collector.storage.raw_log.fsync_directory", side_effect=OSError("directory sync failed")):
                     with self.assertRaisesRegex(OSError, "directory sync failed"):
                         repair_truncated_tail(path)
                 self.assertEqual(prefix + tail, path.read_bytes())
@@ -557,7 +557,7 @@ class ForensicDurabilityTests(ReadinessFixture):
             self.assertEqual(tail, copies[0].read_bytes())
             fsync_directory(directory, strict=strict)
 
-        with patch("poll_journal.fsync_directory", side_effect=sync) as directory_sync:
+        with patch("bkk_collector.storage.poll_journal.fsync_directory", side_effect=sync) as directory_sync:
             recovery = repair_jsonl_tail(path)
         directory_sync.assert_called_once_with(path.parent, strict=True)
         self.assertEqual(prefix, path.read_bytes())
@@ -572,7 +572,7 @@ class ForensicDurabilityTests(ReadinessFixture):
         tail = b'{"poll_id":"unfinished"'
         with path.open("ab") as handle:
             handle.write(tail)
-        with patch("poll_journal.fsync_directory", side_effect=OSError("directory sync failed")):
+        with patch("bkk_collector.storage.poll_journal.fsync_directory", side_effect=OSError("directory sync failed")):
             with self.assertRaisesRegex(OSError, "directory sync failed"):
                 repair_jsonl_tail(path)
         self.assertEqual(prefix + tail, path.read_bytes())
@@ -586,13 +586,13 @@ class ForensicDurabilityTests(ReadinessFixture):
         self.assertEqual(2, len(list(path.parent.glob(path.name + ".corrupt-tail-*"))))
 
     def test_directory_sync_strict_failures_propagate_and_close_descriptor(self):
-        with patch("atomic_io.os.open", side_effect=PermissionError("directory unavailable")):
+        with patch("bkk_collector.storage.atomic_io.os.open", side_effect=PermissionError("directory unavailable")):
             self.assertIsNone(fsync_directory(self.data))
             with self.assertRaises(PermissionError):
                 fsync_directory(self.data, strict=True)
-        with patch("atomic_io.os.open", return_value=123), \
-                patch("atomic_io.os.fsync", side_effect=OSError("sync unsupported")), \
-                patch("atomic_io.os.close") as close:
+        with patch("bkk_collector.storage.atomic_io.os.open", return_value=123), \
+                patch("bkk_collector.storage.atomic_io.os.fsync", side_effect=OSError("sync unsupported")), \
+                patch("bkk_collector.storage.atomic_io.os.close") as close:
             self.assertIsNone(fsync_directory(self.data))
             with self.assertRaisesRegex(OSError, "sync unsupported"):
                 fsync_directory(self.data, strict=True)
@@ -605,7 +605,7 @@ class JournalRecoveryTests(ReadinessFixture):
         value = self.collector()
         for feed in FEED_NAMES:
             value.process_result(response(feed, sample(feed, int(self.now)), feed, self.now), [])
-        with patch("collector.append_poll_event", side_effect=OSError("journal unavailable")):
+        with patch("bkk_collector.collector.append_poll_event", side_effect=OSError("journal unavailable")):
             value.process_result(response("tripupdates", sample("tripupdates", int(self.now)), "missing", self.now + 10), [])
         value.process_result(response("vehiclepositions", sample("vehiclepositions", int(self.now)), "other-feed", self.now + 11), [])
         status = value._commit_and_write_status("status", [])
@@ -641,7 +641,7 @@ class JournalRecoveryTests(ReadinessFixture):
     def test_checkpoint_failure_preserves_complete_append(self):
         path = self.data / "polls.jsonl"
         append_poll_jsonl(path, {"poll_id": "one"})
-        with patch("poll_journal.atomic_write_json", side_effect=OSError("checkpoint full")):
+        with patch("bkk_collector.storage.poll_journal.atomic_write_json", side_effect=OSError("checkpoint full")):
             with self.assertRaises(OSError):
                 append_poll_jsonl(path, {"poll_id": "two"})
         append_poll_jsonl(path, {"poll_id": "three"})

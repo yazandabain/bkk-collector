@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from atomic_io import append_jsonl, atomic_write_bytes, atomic_write_json, fsync_directory, read_json
+from bkk_collector.storage.atomic_io import append_jsonl, atomic_write_bytes, atomic_write_json, fsync_directory, read_json
 
 
 def recent_partition_files(root: Path, filename: str, today: str) -> list[Path]:

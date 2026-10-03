@@ -13,10 +13,10 @@ import statistics
 import sys
 from datetime import datetime, timezone
 
-from gtfs_rt_parse import parse_feed, parse_trip_updates
+from bkk_collector.realtime.gtfs_rt_parse import parse_feed, parse_trip_updates
 from quality_diagnostics import RevisionDistribution
-from raw_log import iter_records
-from trip_update_policy import TRIP_UPDATE_KEY_FIELDS
+from bkk_collector.storage.raw_log import iter_records
+from bkk_collector.realtime.trip_update_policy import TRIP_UPDATE_KEY_FIELDS
 
 
 SUPPORTED_FIELDS = ("arrival_time", "departure_time", "arrival_delay", "departure_delay", "trip_delay")

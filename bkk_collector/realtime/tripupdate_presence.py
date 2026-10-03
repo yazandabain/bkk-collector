@@ -12,8 +12,8 @@ import json
 import uuid
 from pathlib import Path
 
-from raw_log import append_record, iter_records, repair_truncated_tail
-from trip_update_policy import TRIP_UPDATE_KEY_FIELDS
+from bkk_collector.storage.raw_log import append_record, iter_records, repair_truncated_tail
+from bkk_collector.realtime.trip_update_policy import TRIP_UPDATE_KEY_FIELDS
 
 
 PRESENCE_VERSION = 1

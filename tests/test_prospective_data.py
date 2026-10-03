@@ -5,10 +5,10 @@ from copy import deepcopy
 from dataclasses import replace
 from unittest.mock import patch
 
-from gtfs_rt_parse import parse_feed
-from raw_log import iter_records
+from bkk_collector.realtime.gtfs_rt_parse import parse_feed
+from bkk_collector.storage.raw_log import iter_records
 from tests.test_collector_readiness import ReadinessFixture, response, sample
-from tripupdate_presence import TripUpdatePresence, apply_presence_record, apply_source_timestamp_record, iter_presence, presence_path
+from bkk_collector.realtime.tripupdate_presence import TripUpdatePresence, apply_presence_record, apply_source_timestamp_record, iter_presence, presence_path
 
 
 class AuxiliaryPreservationTests(ReadinessFixture):
@@ -20,7 +20,7 @@ class AuxiliaryPreservationTests(ReadinessFixture):
         return feed
 
     def observe(self, collector, feed, index):
-        with patch("collector.time.monotonic", return_value=40 + index * 10):
+        with patch("bkk_collector.collector.time.monotonic", return_value=40 + index * 10):
             collector.process_result(response("tripupdates", feed, f"poll-{index}", self.now + index * 10), [])
 
     def raw(self):
@@ -56,7 +56,7 @@ class AuxiliaryPreservationTests(ReadinessFixture):
         old, new = self.feed([]), self.feed([("new", "geometry")])
         self.observe(collector, old, 0)
         signature = collector._archived_trip_auxiliary_sha256
-        with patch("collector.append_record", side_effect=OSError("storage unavailable")):
+        with patch("bkk_collector.collector.append_record", side_effect=OSError("storage unavailable")):
             self.observe(collector, new, 1)
         self.assertEqual(signature, collector._archived_trip_auxiliary_sha256)
         self.assertFalse(self.events()[-1]["raw_ok"])
@@ -101,7 +101,7 @@ class AuxiliaryPreservationTests(ReadinessFixture):
 
 class SourceTimestampTests(ReadinessFixture):
     def rows(self, timestamp=100):
-        from gtfs_rt_parse import parse_trip_updates
+        from bkk_collector.realtime.gtfs_rt_parse import parse_trip_updates
         feed = sample("tripupdates", int(self.now))
         feed.entity[0].trip_update.timestamp = timestamp
         return parse_trip_updates(feed, {})
@@ -118,7 +118,7 @@ class SourceTimestampTests(ReadinessFixture):
         feed = sample("tripupdates", int(self.now))
         for index, timestamp in enumerate((100, 101)):
             feed.entity[0].trip_update.timestamp = timestamp
-            with patch("collector.time.monotonic", return_value=40 + index * 10):
+            with patch("bkk_collector.collector.time.monotonic", return_value=40 + index * 10):
                 collector.process_result(response("tripupdates", feed, f"poll-{index}", self.now + index * 10), [])
         path = presence_path(self.data, self.date)
         records = [record for _, record in iter_presence(path)]
@@ -145,7 +145,7 @@ class SourceTimestampTests(ReadinessFixture):
     def test_failed_append_never_advances_source_timestamp_state(self):
         tracker = TripUpdatePresence(self.data, "run")
         tracker.observe(self.rows(100), self.date, self.now, {})
-        with patch("tripupdate_presence.append_record", side_effect=OSError("unavailable")):
+        with patch("bkk_collector.realtime.tripupdate_presence.append_record", side_effect=OSError("unavailable")):
             with self.assertRaises(OSError):
                 tracker.observe(self.rows(101), self.date, self.now + 1, {})
         self.assertEqual([100], list(tracker._source_timestamps.values()))
@@ -196,8 +196,8 @@ class SourceTimestampTests(ReadinessFixture):
                 apply_source_timestamp_record(None, record, members)
 
     def test_manifest_refuses_missing_journal_promised_source_evidence(self):
-        from manifests import _presence_stats
-        from raw_log import append_record
+        from bkk_collector.archive.manifests import _presence_stats
+        from bkk_collector.storage.raw_log import append_record
         tracker = TripUpdatePresence(self.data, "run")
         evidence = tracker.observe(self.rows(), self.date, self.now, {"poll_id": "poll"})
         path = presence_path(self.data, self.date)

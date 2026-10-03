@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-from atomic_io import read_json
+from bkk_collector.storage.atomic_io import read_json
 
 
 def main() -> int:

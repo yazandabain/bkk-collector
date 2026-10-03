@@ -12,19 +12,19 @@ from unittest.mock import Mock, patch
 
 from google.transit import gtfs_realtime_pb2 as pb
 
-import realcity
-from atomic_io import atomic_write_json, sha256_file
-from backup import BackupManager
-from collector import Collector, FetchResult
-from config import CollectorConfig, FEED_NAMES
-from dedup import ChangeTracker
-from gtfs_rt_parse import parse_alerts, parse_trip_updates, parse_vehicle_positions
-from manifests import build_daily_manifest
-from monitoring import HealthMonitor, append_poll_event, entity_timestamp_range, evaluate_freshness
-from parquet_compact import compact_partition
-from parquet_store import DurableParquetSpool, parquet_row_count, write_parquet_atomic
-from raw_log import append_record, iter_records, repair_truncated_tail
-from static_gtfs import StaticGtfsStore
+from bkk_collector.realtime import realcity
+from bkk_collector.storage.atomic_io import atomic_write_json, sha256_file
+from bkk_collector.archive.backup import BackupManager
+from bkk_collector.collector import Collector, FetchResult
+from bkk_collector.config import CollectorConfig, FEED_NAMES
+from bkk_collector.realtime.dedup import ChangeTracker
+from bkk_collector.realtime.gtfs_rt_parse import parse_alerts, parse_trip_updates, parse_vehicle_positions
+from bkk_collector.archive.manifests import build_daily_manifest
+from bkk_collector.monitoring import HealthMonitor, append_poll_event, entity_timestamp_range, evaluate_freshness
+from bkk_collector.storage.parquet_compact import compact_partition
+from bkk_collector.storage.parquet_store import DurableParquetSpool, parquet_row_count, write_parquet_atomic
+from bkk_collector.storage.raw_log import append_record, iter_records, repair_truncated_tail
+from bkk_collector.archive.static_gtfs import StaticGtfsStore
 
 
 def feed_message(timestamp: int = 100) -> pb.FeedMessage:
@@ -178,7 +178,7 @@ class ReliabilityTests(unittest.TestCase):
             data_dir = Path(temporary)
             spool = DurableParquetSpool(data_dir, flush_seconds=0)
             segment = spool.stage("alerts", "2026-08-22", "poll", [{"schema_version": 2, "entity_id": "a"}])
-            with patch("parquet_store.write_parquet_atomic", side_effect=OSError("disk full")):
+            with patch("bkk_collector.storage.parquet_store.write_parquet_atomic", side_effect=OSError("disk full")):
                 result = spool.flush(force=True)
             self.assertFalse(result.ok)
             self.assertTrue(segment.exists())
@@ -197,8 +197,8 @@ class ReliabilityTests(unittest.TestCase):
                 path.write_bytes(b"valid-for-mocked-counter")
                 row_counts[path] = sum(1 for _ in rows)
 
-            with patch("parquet_store.write_parquet_atomic", side_effect=fake_write), patch(
-                "parquet_store.parquet_row_count", side_effect=lambda path: row_counts[path]
+            with patch("bkk_collector.storage.parquet_store.write_parquet_atomic", side_effect=fake_write), patch(
+                "bkk_collector.storage.parquet_store.parquet_row_count", side_effect=lambda path: row_counts[path]
             ):
                 result = spool.flush(force=True)
             self.assertTrue(result.ok)
@@ -217,8 +217,8 @@ class ReliabilityTests(unittest.TestCase):
                 path.write_bytes(b"valid-for-mocked-counter")
                 row_counts[path] = sum(1 for _ in rows)
 
-            with patch("parquet_store.write_parquet_atomic", side_effect=fake_write), patch(
-                "parquet_store.parquet_row_count", side_effect=lambda path: row_counts[path]
+            with patch("bkk_collector.storage.parquet_store.write_parquet_atomic", side_effect=fake_write), patch(
+                "bkk_collector.storage.parquet_store.parquet_row_count", side_effect=lambda path: row_counts[path]
             ):
                 result = second.flush(force=True)
             self.assertEqual(1, result.rows_written)
@@ -661,7 +661,7 @@ class BackupTests(unittest.TestCase):
 
     def test_backup_failure_remains_pending(self):
         manager = self.manager(FakeBackupApi(self.root, fail_upload=True))
-        with patch("backup.build_daily_manifest", return_value=self.complete_manifest):
+        with patch("bkk_collector.archive.backup.build_daily_manifest", return_value=self.complete_manifest):
             result = manager.backup_date(self.date)
         self.assertFalse(result.success)
         self.assertIn(self.date, manager.pending_dates())
@@ -671,7 +671,7 @@ class BackupTests(unittest.TestCase):
         api = FakeBackupApi(self.root)
         manager = self.manager(api)
         manifest = {"complete": False, "completeness_errors": ["missing tripupdates raw"], "artifacts": []}
-        with patch("backup.build_daily_manifest", return_value=manifest):
+        with patch("bkk_collector.archive.backup.build_daily_manifest", return_value=manifest):
             result = manager.backup_date(self.date)
         self.assertFalse(result.success)
         self.assertEqual([], api.uploaded)
@@ -682,7 +682,7 @@ class BackupTests(unittest.TestCase):
         manager = self.manager(api)
         malformed = dict(self.complete_manifest)
         malformed["artifacts"] = []
-        with patch("backup.build_daily_manifest", return_value=malformed):
+        with patch("bkk_collector.archive.backup.build_daily_manifest", return_value=malformed):
             result = manager.backup_date(self.date)
         self.assertFalse(result.success)
         self.assertEqual([], api.uploaded)
@@ -690,7 +690,7 @@ class BackupTests(unittest.TestCase):
 
     def test_remote_mismatch_is_not_marked_successful(self):
         manager = self.manager(FakeBackupApi(self.root, wrong_size=True))
-        with patch("backup.build_daily_manifest", return_value=self.complete_manifest):
+        with patch("bkk_collector.archive.backup.build_daily_manifest", return_value=self.complete_manifest):
             result = manager.backup_date(self.date)
         self.assertFalse(result.success)
         self.assertEqual(set(), manager.confirmed_dates())
@@ -698,7 +698,7 @@ class BackupTests(unittest.TestCase):
     def test_receipt_is_created_only_after_remote_verification(self):
         api = FakeBackupApi(self.root)
         manager = self.manager(api)
-        with patch("backup.build_daily_manifest", return_value=self.complete_manifest):
+        with patch("bkk_collector.archive.backup.build_daily_manifest", return_value=self.complete_manifest):
             result = manager.backup_date(self.date)
         self.assertTrue(result.success)
         self.assertEqual({self.date}, manager.confirmed_dates())
