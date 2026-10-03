@@ -148,9 +148,12 @@ class ChangeTracker:
         # dictionary on every poll amplified both memory and scheduler latency.
         prospective = {}
         for row in rows:
-            key = tuple(row.get(f) for f in self.key_fields)
-            exact_vals = tuple(row.get(f) for f in self.value_fields)
-            numeric_vals = tuple(row.get(f) for f in self.numeric_tolerance_fields)
+            # dict.get still supplies None for absent optional fields. Mapping
+            # the bound method avoids millions of Python generator resumptions
+            # per large TU poll without changing field order or comparisons.
+            key = tuple(map(row.get, self.key_fields))
+            exact_vals = tuple(map(row.get, self.value_fields))
+            numeric_vals = tuple(map(row.get, self.numeric_tolerance_fields))
 
             prev = prospective.get(key, self._last.get(key))
             if prev is None:
@@ -173,7 +176,7 @@ class ChangeTracker:
     def commit(self, rows: list, date_str: str, now_ts: float) -> None:
         self._maybe_reset(date_str)
         for row in rows:
-            key = tuple(row.get(f) for f in self.key_fields)
-            exact_vals = tuple(row.get(f) for f in self.value_fields)
-            numeric_vals = tuple(row.get(f) for f in self.numeric_tolerance_fields)
+            key = tuple(map(row.get, self.key_fields))
+            exact_vals = tuple(map(row.get, self.value_fields))
+            numeric_vals = tuple(map(row.get, self.numeric_tolerance_fields))
             self._last[key] = (exact_vals, numeric_vals, now_ts)

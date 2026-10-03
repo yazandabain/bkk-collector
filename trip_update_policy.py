@@ -94,8 +94,9 @@ TRIP_UPDATE_IMMUTABLE_OR_REDUNDANT_FIELDS = (
     "departure_occupancy_status_name",
 )
 
-# Retained as provenance on every emitted row.  Including any of these in the
-# comparison would manufacture a change on virtually every successful poll.
+# Retained on emitted rows; per-trip source timestamps also have an exact
+# delta stream in presence evidence, and poll headers live in poll journals.
+# Including these in prediction comparison would defeat useful compression.
 TRIP_UPDATE_COLLECTION_METADATA_FIELDS = (
     "poll_id",
     "request_started_at",

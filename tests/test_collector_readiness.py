@@ -247,7 +247,7 @@ class ParquetIsolationTests(ReadinessFixture):
 
 
 class PresenceTests(ReadinessFixture):
-    def test_trip_updates_with_shapes_keep_rows_presence_and_raw_cadence(self):
+    def test_changed_shapes_preserve_raw_without_changing_rows_presence_or_normal_cadence(self):
         value = self.collector()
         feed = sample("tripupdates", int(self.now))
         for index in range(3):
@@ -269,9 +269,10 @@ class PresenceTests(ReadinessFixture):
         raw = self.data / "raw" / "tripupdates" / f"date={self.date}" / "tripupdates.rawlog"
         with raw.open("rb") as handle:
             snapshots = list(iter_records(handle))
-        self.assertEqual(1, len(snapshots))
+        self.assertEqual(2, len(snapshots))
         archived = pb.FeedMessage.FromString(snapshots[0][1])
         self.assertEqual(3, sum(entity.HasField("shape") for entity in archived.entity))
+        self.assertEqual(feed.SerializeToString(), snapshots[-1][1])
         self.assertEqual([], value.monitor.feeds["tripupdates"]["freshness_flags"])
         result = value.spool.flush(force=True)
         self.assertTrue(result.ok, result.errors)

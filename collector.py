@@ -187,6 +187,10 @@ class Collector:
         self.last_raw_archive_monotonic: dict[str, float | None] = {
             feed_name: None for feed_name in FEED_NAMES
         }
+        # Auxiliary TU entities have no Parquet representation. Their exact
+        # state (including withdrawals) must not disappear between raw polls.
+        # This signature advances only when the full response is durable.
+        self._archived_trip_auxiliary_sha256: str | None = None
         self.raw_needs_repair: set[Path] = set()
         self.trackers = self._make_trackers()
         self.scheduler: IndependentFeedScheduler | None = None
@@ -287,9 +291,10 @@ class Collector:
         atomic_write_json(self.config.data_dir / "metadata" / "collector_runs" / f"{self.run_id}.json", {
             "version": 1, "run_id": self.run_id, "started_at": utc_iso(),
             "collector_git_commit": os.environ.get("COLLECTOR_GIT_COMMIT", "unknown"),
-            "schema_version": 2, "presence_version": 1,
+            "schema_version": 2, "presence_version": 1, "presence_source_timestamps_version": 1,
             "poll_intervals_seconds": config.feed_intervals,
             "raw_archive_intervals_seconds": config.raw_archive_intervals,
+            "trip_auxiliary_raw_policy": "full_response_on_auxiliary_state_change",
             "numeric_tolerances": config.trip_update_numeric_tolerances,
             "heartbeat_seconds": config.heartbeat_seconds, "raw_fsync": config.raw_fsync,
             "change_tracker_null_guard_rows": config.change_tracker_null_guard_rows,
@@ -465,6 +470,9 @@ class Collector:
         presence_ok = True
         presence_details: dict[str, Any] = {}
         presence_error = None
+        auxiliary_sha256 = None
+        auxiliary_count = 0
+        auxiliary_changed = False
         try:
             feed = parse_feed(result.payload)
             _validate_feed_entities(result.feed_name, feed)
@@ -483,6 +491,21 @@ class Collector:
         except Exception as error:
             parse_error = _redact_error(error, self.config.api_key)
             self.logger.exception("Failed parsing %s; preserving a raw fallback", result.feed_name)
+
+        if parse_ok and result.feed_name == "tripupdates":
+            auxiliary_digest = hashlib.sha256()
+            auxiliary_entities = sorted(
+                entity.SerializeToString(deterministic=True) for entity in feed.entity
+                if any(entity.HasField(kind) for kind in ("shape", "stop", "trip_modifications"))
+            )
+            auxiliary_count = len(auxiliary_entities)
+            for value in auxiliary_entities:
+                auxiliary_digest.update(len(value).to_bytes(8, "big"))
+                auxiliary_digest.update(value)
+            auxiliary_sha256 = auxiliary_digest.hexdigest()
+            auxiliary_changed = auxiliary_sha256 != self._archived_trip_auxiliary_sha256
+            if auxiliary_changed and not raw_archived:
+                raw_archived, raw_ok, raw_error = self._archive_raw(result, date_str, force=True)
 
         if result.feed_name == "tripupdates":
             if parse_ok:
@@ -544,6 +567,9 @@ class Collector:
                 raw_ok = fallback_ok
                 raw_error = fallback_error
 
+        if auxiliary_sha256 is not None and raw_archived and raw_ok:
+            self._archived_trip_auxiliary_sha256 = auxiliary_sha256
+
         header_timestamp = None
         min_entity_timestamp = None
         max_entity_timestamp = None
@@ -602,6 +628,9 @@ class Collector:
             "payload_sha256": payload_hash,
             "entity_content_sha256": content_hash,
             "feed_header_timestamp": header_timestamp,
+            "feed_header_version": feed.header.feed_version if feed is not None and feed.header.HasField("feed_version") else None,
+            "gtfs_realtime_version": feed.header.gtfs_realtime_version if feed is not None else None,
+            "feed_incrementality": feed.header.incrementality if feed is not None else None,
             "min_entity_timestamp": min_entity_timestamp,
             "max_entity_timestamp": max_entity_timestamp,
             "entity_count": entity_count,
@@ -612,6 +641,9 @@ class Collector:
             "raw_ok": raw_ok,
             "raw_path": str(self._raw_path(result.feed_name, date_str).relative_to(self.config.data_dir)) if raw_archived else None,
             "raw_error": raw_error,
+            "trip_auxiliary_entities": auxiliary_count if result.feed_name == "tripupdates" else None,
+            "trip_auxiliary_sha256": auxiliary_sha256,
+            "trip_auxiliary_state_changed": auxiliary_changed if result.feed_name == "tripupdates" else None,
             "parse_ok": parse_ok,
             "parsed_rows": len(parsed_rows),
             # selected_rows describes the change decision. emitted_rows is

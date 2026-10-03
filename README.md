@@ -22,7 +22,7 @@ three-feed cycle.
 | Feed | Raw protobuf default | Derived Parquet default |
 | --- | --- | --- |
 | VehiclePositions | every successful poll (10 s default) | every observation (10 s default) |
-| TripUpdates | every 300 s, plus forced failure fallback | evaluated every poll (10 s); meaningful changes plus 30-minute heartbeat |
+| TripUpdates | every 300 s, auxiliary-state changes, and forced failure fallback | evaluated every poll (10 s); meaningful changes plus 30-minute heartbeat |
 | Alerts | every successful poll (30 s default) | changed rows plus 30-minute heartbeat |
 
 The raw archive is authoritative **at the timestamps it contains**. In
@@ -33,15 +33,17 @@ equivalent to full 10-second raw protobuf history. The first successful sample
 after every collector start is always raw-archived for every feed.
 
 Standard auxiliary entities (shapes, dynamic stops, and trip modifications)
-may accompany the primary feed records. Their bytes remain in configured raw
-snapshots; only the feed's VehiclePositions, TripUpdates, or Alerts are
+may accompany the primary feed records. TripUpdates auxiliary-state changes,
+including withdrawals, force full raw preservation between periodic snapshots.
+Only the feed's VehiclePositions, TripUpdates, or Alerts are
 projected into Parquet and TripUpdates presence. Invalid or wrong-primary
 entity payloads still fail health and force full raw fallback.
 
 TripUpdates also has a separate, fsynced presence log at every valid full-feed
 observation. It records trip/stop-visit membership, including unchanged polls,
-withdrawals, and reappearances. This does not change prediction compression or
-raw cadence; absence means only absent from that observation, not cancellation
+withdrawals, reappearances, and optional per-trip source-timestamp deltas. This
+does not change prediction compression or the periodic raw cadence; absence
+means only absent from that observation, not cancellation
 or completion. This evidence starts with the new version and cannot repair
 the missing high-frequency presence history in older collection.
 
@@ -56,6 +58,8 @@ entity_id + trip_id + start_date + start_time + stop_sequence + stop_id
 
 This distinguishes repeated visits by one trip to the same stop. Every parsed
 TripUpdates field is explicitly classified in `trip_update_policy.py`.
+See the [collection policy](docs/collection-policy.md) for cadence evidence,
+source-timestamp and auxiliary-entity preservation, and research limitations.
 Meaningful schedule, trip-property, vehicle-assignment, uncertainty, stop-state,
 and BKK-extension changes emit rows. Delay, predicted-time, and stop-distance
 noise uses the configured tolerance against the last durably staged value.
@@ -250,6 +254,9 @@ identities are `stop_sequence, stop_visit_fallback_index, stop_id`. A record
 confirms membership even with an empty change list. Trip-only entities retain
 an empty stop set. Stream IDs and sequence numbers detect missing deltas; new
 baselines reset knowledge rather than asserting disappearance during a gap.
+The additive source-timestamp section is replayed after membership with
+`apply_source_timestamp_record`. Older records remain readable but have unknown
+source-timestamp history; source timestamps do not trigger prediction rows.
 
 Parquet schema version 2 keeps scalar research fields plus canonical JSON for
 repeated/nested structures. It includes current standard GTFS-RT metadata,
