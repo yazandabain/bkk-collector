@@ -10,7 +10,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from monitoring import utc_iso
+from bkk_collector.monitoring import utc_iso
 
 
 @dataclass

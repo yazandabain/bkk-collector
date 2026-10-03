@@ -13,23 +13,23 @@ from unittest.mock import patch
 
 from google.transit import gtfs_realtime_pb2 as pb
 
-import realcity
-from atomic_io import append_jsonl, read_json, sha256_file
-from backup import BackupManager
-from collector import Collector, FetchResult
-from config import CollectorConfig, DEFAULT_FEED_INTERVALS, FEED_NAMES, MaintenanceConfig
-from dedup import ChangeTracker, ChangeTrackerSignalError
-from diagnostics import summarize_live_sample
-from gtfs_rt_parse import parse_trip_updates, parse_vehicle_positions
-from manifests import _feed_stats
-from maintenance import MaintenanceWorker
-from migrate_legacy import LegacyMigrator
-from parquet_store import PARQUET_COLUMNS, write_parquet_atomic
-from quality_diagnostics import prediction_revision_report, tripupdate_static_join_report
-from raw_log import append_record, scan_raw_log
-from realtime_scheduler import IndependentFeedScheduler
-from static_gtfs import StaticGtfsStore
-from trip_update_policy import (
+from bkk_collector.realtime import realcity
+from bkk_collector.storage.atomic_io import append_jsonl, read_json, sha256_file
+from bkk_collector.archive.backup import BackupManager
+from bkk_collector.collector import Collector, FetchResult
+from bkk_collector.config import CollectorConfig, DEFAULT_FEED_INTERVALS, FEED_NAMES, MaintenanceConfig
+from bkk_collector.realtime.dedup import ChangeTracker, ChangeTrackerSignalError
+from bkk_collector.cli.diagnostics import summarize_live_sample
+from bkk_collector.realtime.gtfs_rt_parse import parse_trip_updates, parse_vehicle_positions
+from bkk_collector.archive.manifests import _feed_stats
+from bkk_collector.maintenance import MaintenanceWorker
+from bkk_collector.cli.migrate_legacy import LegacyMigrator
+from bkk_collector.storage.parquet_store import PARQUET_COLUMNS, write_parquet_atomic
+from bkk_collector.cli.quality_diagnostics import prediction_revision_report, tripupdate_static_join_report
+from bkk_collector.storage.raw_log import append_record, scan_raw_log
+from bkk_collector.realtime.realtime_scheduler import IndependentFeedScheduler
+from bkk_collector.archive.static_gtfs import StaticGtfsStore
+from bkk_collector.realtime.trip_update_policy import (
     TRIP_UPDATE_COLLECTION_METADATA_FIELDS,
     TRIP_UPDATE_EXACT_MUTABLE_FIELDS,
     TRIP_UPDATE_IMMUTABLE_OR_REDUNDANT_FIELDS,
@@ -260,7 +260,7 @@ class FinalReadinessTests(unittest.TestCase):
                 error=None,
             )
             first = Collector(config)
-            with patch("collector.time.monotonic", return_value=42):
+            with patch("bkk_collector.collector.time.monotonic", return_value=42):
                 archived, ok, _path = first._archive_raw(result, "2026-08-23")
             self.assertTrue(archived and ok)
             first.executor.shutdown(wait=True)
@@ -269,7 +269,7 @@ class FinalReadinessTests(unittest.TestCase):
 
             restarted = Collector(config)
             restarted_result = FetchResult(**{**result.__dict__, "poll_id": "restart", "payload": b"restart"})
-            with patch("collector.time.monotonic", return_value=3):
+            with patch("bkk_collector.collector.time.monotonic", return_value=3):
                 archived, ok, _path = restarted._archive_raw(restarted_result, "2026-08-23")
             self.assertTrue(archived and ok)
             restarted.executor.shutdown(wait=True)
@@ -314,7 +314,7 @@ class FinalReadinessTests(unittest.TestCase):
                 payload=b"current-raw-remains-collectable",
                 error=None,
             )
-            with patch("collector.repair_truncated_tail", side_effect=PermissionError("legacy read-only")):
+            with patch("bkk_collector.collector.repair_truncated_tail", side_effect=PermissionError("legacy read-only")):
                 archived, ok, _path = collector._archive_raw(result, "2026-08-23")
             self.assertTrue(archived and ok)
             self.assertIn(prior, collector.raw_needs_repair)
@@ -503,7 +503,7 @@ class FinalReadinessTests(unittest.TestCase):
             raw = raw_feed.SerializeToString()
             intervals = {"vehiclepositions": 10, "tripupdates": 15, "alerts": 30}
             expected = {"vehiclepositions": 8640, "tripupdates": 5760, "alerts": 2880}
-            from monitoring import append_poll_event
+            from bkk_collector.monitoring import append_poll_event
 
             for feed, interval in intervals.items():
                 append_record(data_dir / "raw" / feed / f"date={date}" / f"{feed}.rawlog", 1, raw)
@@ -542,7 +542,7 @@ class FinalReadinessTests(unittest.TestCase):
         self.assertEqual(1, summary["bkk_non_null_parsed_rows"]["bkk_vehicle_model"])
 
     def test_scheduler_health_is_cadence_aware(self):
-        from monitoring import HealthMonitor
+        from bkk_collector.monitoring import HealthMonitor
 
         with tempfile.TemporaryDirectory() as temporary:
             monitor = HealthMonitor(
@@ -591,7 +591,7 @@ class FinalReadinessTests(unittest.TestCase):
             self.assertEqual(90, status["feeds"]["alerts"]["absence_threshold_seconds"])
 
     def test_all_null_change_tracker_signal_is_persisted_as_unhealthy_data(self):
-        from monitoring import HealthMonitor
+        from bkk_collector.monitoring import HealthMonitor
 
         with tempfile.TemporaryDirectory() as temporary:
             monitor = HealthMonitor(
@@ -656,17 +656,17 @@ class FinalReadinessTests(unittest.TestCase):
 
             timestamp = datetime.now(timezone.utc).timestamp()
             date = datetime.now(timezone.utc).date().isoformat()
-            with patch("collector.time.monotonic", return_value=100):
+            with patch("bkk_collector.collector.time.monotonic", return_value=100):
                 collector.process_result(result("first", timestamp), [])
             feed.entity[0].trip_update.stop_time_update[0].arrival.delay = 100
             changed_raw = feed.SerializeToString()
-            with patch("collector.time.monotonic", return_value=110), patch.object(
+            with patch("bkk_collector.collector.time.monotonic", return_value=110), patch.object(
                 collector.spool, "stage", side_effect=OSError("disk write failed")
             ):
                 collector.process_result(result("fallback", timestamp + 10, changed_raw), [])
             path = data_dir / "raw/tripupdates" / f"date={date}" / "tripupdates.rawlog"
             self.assertEqual(2, scan_raw_log(path).complete_records)
-            from monitoring import iter_jsonl, poll_journal_path
+            from bkk_collector.monitoring import iter_jsonl, poll_journal_path
 
             events = [event for _line, event in iter_jsonl(poll_journal_path(data_dir, "tripupdates", date))]
             self.assertGreater(events[-1]["selected_rows"], 0)
@@ -841,7 +841,7 @@ class FinalReadinessTests(unittest.TestCase):
             worker = MaintenanceWorker(
                 MaintenanceConfig(data_dir=data_dir, hf_token="", hf_repo_id="")
             )
-            with patch("maintenance.compact_partition") as compact:
+            with patch("bkk_collector.maintenance.compact_partition") as compact:
                 worker.compact_pending_dates()
             worker.session.close()
             compact.assert_not_called()

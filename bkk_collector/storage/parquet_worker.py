@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 
-from parquet_store import DurableParquetSpool
+from bkk_collector.storage.parquet_store import DurableParquetSpool
 
 
 class ParquetCommitWorker:

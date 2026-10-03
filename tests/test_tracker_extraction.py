@@ -1,7 +1,7 @@
 import random
 import unittest
 
-from dedup import ChangeTracker
+from bkk_collector.realtime.dedup import ChangeTracker
 
 
 class TrackerExtractionTests(unittest.TestCase):

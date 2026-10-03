@@ -8,6 +8,8 @@ public-output
 .venv
 __pycache__
 .pytest_cache
+build
+*.egg-info
 data
 *.parquet
 *.rawlog

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from gtfs_rt_parse import parse_feed, parse_vehicle_positions
+from bkk_collector.realtime.gtfs_rt_parse import parse_feed, parse_vehicle_positions
 from public_exporter.source import LatestVehicleFrame, MODE_COLORS, RouteCatalog, label, read_object
 
 FEEDS = ("vehiclepositions", "tripupdates", "alerts")

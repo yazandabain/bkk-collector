@@ -57,7 +57,8 @@ entity_id + trip_id + start_date + start_time + stop_sequence + stop_id
 ```
 
 This distinguishes repeated visits by one trip to the same stop. Every parsed
-TripUpdates field is explicitly classified in `trip_update_policy.py`.
+TripUpdates field is explicitly classified in
+`bkk_collector/realtime/trip_update_policy.py`.
 See the [collection policy](docs/collection-policy.md) for cadence evidence,
 source-timestamp and auxiliary-entity preservation, and research limitations.
 Meaningful schedule, trip-property, vehicle-assignment, uncertainty, stop-state,
@@ -247,7 +248,8 @@ presence stream/sequence. Run metadata records only allowlisted non-secret
 settings (cadences, numeric tolerances, heartbeat, fsync, schema/commit).
 
 `presence.jsonlog` uses the same timestamp/length/gzip framing as raw logs,
-but its payload is JSON, not protobuf. `tripupdate_presence.iter_presence`
+but its payload is JSON, not protobuf.
+`bkk_collector.realtime.tripupdate_presence.iter_presence`
 reads it; `apply_presence_record` replays its versioned baselines/deltas.
 Trip identities are `entity_id, trip_id, start_date, start_time`; stop-visit
 identities are `stop_sequence, stop_visit_fallback_index, stop_id`. A record
@@ -710,6 +712,10 @@ the chosen previous directory back to
 are never changed by a rebuild.
 
 ## Tests
+
+The backend is an installable `bkk_collector` package. Existing root script
+commands remain compatible. See [backend development](docs/development.md)
+for package boundaries, installed commands and compatibility invariants.
 
 ```bash
 python -m venv .venv

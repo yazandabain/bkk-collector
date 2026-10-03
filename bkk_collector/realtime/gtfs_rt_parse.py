@@ -13,7 +13,7 @@ from typing import Any
 from google.protobuf.json_format import MessageToDict
 from google.transit import gtfs_realtime_pb2 as pb
 
-import realcity
+from bkk_collector.realtime import realcity
 
 
 SCHEMA_VERSION = 2

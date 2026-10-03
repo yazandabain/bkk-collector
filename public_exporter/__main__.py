@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-from atomic_io import atomic_write_json
+from bkk_collector.storage.atomic_io import atomic_write_json
 from public_exporter.snapshot import SnapshotBuilder, iso
 
 

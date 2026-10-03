@@ -7,8 +7,8 @@ import os
 import uuid
 from pathlib import Path
 
-from atomic_io import atomic_write_json, fsync_directory, read_json
-from parquet_store import parquet_row_count
+from bkk_collector.storage.atomic_io import atomic_write_json, fsync_directory, read_json
+from bkk_collector.storage.parquet_store import parquet_row_count
 
 
 def _align_table(table, schema):
