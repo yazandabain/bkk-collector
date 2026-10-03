@@ -19,13 +19,13 @@ from bkk_collector.archive.backup import BackupManager
 from bkk_collector.collector import Collector, FetchResult
 from bkk_collector.config import CollectorConfig, DEFAULT_FEED_INTERVALS, FEED_NAMES, MaintenanceConfig
 from bkk_collector.realtime.dedup import ChangeTracker, ChangeTrackerSignalError
-from diagnostics import summarize_live_sample
+from bkk_collector.cli.diagnostics import summarize_live_sample
 from bkk_collector.realtime.gtfs_rt_parse import parse_trip_updates, parse_vehicle_positions
 from bkk_collector.archive.manifests import _feed_stats
 from bkk_collector.maintenance import MaintenanceWorker
-from migrate_legacy import LegacyMigrator
+from bkk_collector.cli.migrate_legacy import LegacyMigrator
 from bkk_collector.storage.parquet_store import PARQUET_COLUMNS, write_parquet_atomic
-from quality_diagnostics import prediction_revision_report, tripupdate_static_join_report
+from bkk_collector.cli.quality_diagnostics import prediction_revision_report, tripupdate_static_join_report
 from bkk_collector.storage.raw_log import append_record, scan_raw_log
 from bkk_collector.realtime.realtime_scheduler import IndependentFeedScheduler
 from bkk_collector.archive.static_gtfs import StaticGtfsStore

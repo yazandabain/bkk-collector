@@ -21,7 +21,7 @@ from bkk_collector.storage.atomic_io import append_jsonl
 from bkk_collector.monitoring import HealthMonitor
 from bkk_collector.storage.parquet_store import DurableParquetSpool, PARQUET_WRITE_BATCH_ROWS, write_parquet_atomic
 from tests import test_reliability as reliability
-from verify_backup import restore_artifact
+from bkk_collector.cli.verify_backup import restore_artifact
 
 
 class RetentionTests(unittest.TestCase):
@@ -229,10 +229,10 @@ class RetentionTests(unittest.TestCase):
         def response(payload):
             r=Mock();r.__enter__=Mock(return_value=r);r.__exit__=Mock(return_value=False)
             r.iter_content.return_value=iter([payload]);return r
-        with patch('verify_backup.requests.get',return_value=response(data)):
+        with patch('bkk_collector.cli.verify_backup.requests.get',return_value=response(data)):
             result=restore_artifact(self.backup,artifact,'a'*40,self.root/'restore-good')
         self.assertEqual('PASS',result['result'])
-        with patch('verify_backup.requests.get',return_value=response(b'x'*len(data))):
+        with patch('bkk_collector.cli.verify_backup.requests.get',return_value=response(b'x'*len(data))):
             with self.assertRaises(OSError):restore_artifact(self.backup,artifact,'a'*40,self.root/'restore-bad')
 
 
@@ -260,7 +260,7 @@ class MemoryAndHealthTests(unittest.TestCase):
             self.assertFalse(any('freshness incident' in item for item in quality))
 
     def test_recovery_cli_handles_missing_credentials_without_creating_data(self):
-        import verify_backup
+        from bkk_collector.cli import verify_backup
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/'absent-data'
             with patch.dict('os.environ',{'DATA_DIR':str(path),'HF_TOKEN':'','HF_REPO_ID':''}), patch('sys.argv',['verify_backup.py','2026-09-03']), patch('builtins.print'):

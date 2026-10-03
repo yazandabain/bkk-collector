@@ -16,12 +16,12 @@ from google.transit import gtfs_realtime_pb2 as pb
 from urllib3.exceptions import NewConnectionError
 
 from bkk_collector import collector as collector_module
-import rebuild_parquet
+from bkk_collector.cli import rebuild_parquet
 from bkk_collector.storage.atomic_io import atomic_write_json, fsync_directory, read_json, sha256_file
 from bkk_collector.archive.backup import BackupManager
 from bkk_collector.collector import Collector, FetchResult, _new_session
 from bkk_collector.config import CollectorConfig, FEED_NAMES
-from diagnostics import collection_window_report, main as diagnostics_main
+from bkk_collector.cli.diagnostics import collection_window_report, main as diagnostics_main
 from bkk_collector.realtime.gtfs_rt_parse import parse_trip_updates
 from bkk_collector.archive.manifests import _feed_stats, _presence_stats, build_daily_manifest
 from bkk_collector.monitoring import HealthMonitor, append_poll_event, poll_journal_path, utc_iso
@@ -33,7 +33,7 @@ from bkk_collector.realtime.realtime_scheduler import IndependentFeedScheduler
 from bkk_collector.archive.static_gtfs import StaticGtfsStore
 from tests.test_reliability import FakeBackupApi, StaticSession, gtfs_zip_bytes
 from bkk_collector.realtime.tripupdate_presence import TripUpdatePresence, apply_presence_record, iter_presence, presence_path
-from verify_backup import verify_day
+from bkk_collector.cli.verify_backup import verify_day
 
 
 def sample(feed_name: str, timestamp: int, sequences=(1, 2)) -> pb.FeedMessage:
@@ -742,7 +742,7 @@ class RebuildSafetyTests(ReadinessFixture):
                     raise OSError("disk full on second output")
                 return real_write(feed, rows, path)
 
-            with self.subTest(allow_parse_errors=allow), patch("rebuild_parquet.write_parquet_atomic", side_effect=fail_late):
+            with self.subTest(allow_parse_errors=allow), patch("bkk_collector.cli.rebuild_parquet.write_parquet_atomic", side_effect=fail_late):
                 with self.assertRaisesRegex(OSError, "second output"):
                     rebuild_parquet.rebuild_one("vehiclepositions", self.date, chunk_rows=1, allow_parse_errors=allow)
             self.assertEqual(raw_hash, sha256_file(self.raw))
@@ -763,8 +763,8 @@ class RebuildSafetyTests(ReadinessFixture):
     def test_cli_returns_failure_and_continues_remaining_dates(self):
         result = {"raw_records": 1, "rows": 1, "previous_partition": None}
         with patch("sys.argv", ["rebuild_parquet.py", "--feed", "vehiclepositions"]), \
-                patch("rebuild_parquet.all_dates_for", return_value=["2026-09-23", "2026-09-24"]), \
-                patch("rebuild_parquet.rebuild_one", side_effect=[OSError("disk full"), result]) as run, \
+                patch("bkk_collector.cli.rebuild_parquet.all_dates_for", return_value=["2026-09-23", "2026-09-24"]), \
+                patch("bkk_collector.cli.rebuild_parquet.rebuild_one", side_effect=[OSError("disk full"), result]) as run, \
                 patch("sys.stdout", io.StringIO()):
             self.assertEqual(1, rebuild_parquet.main())
             self.assertEqual(2, run.call_count)
@@ -772,8 +772,8 @@ class RebuildSafetyTests(ReadinessFixture):
     def test_cli_default_skips_current_and_future_dates(self):
         tomorrow = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
         with patch("sys.argv", ["rebuild_parquet.py", "--feed", "vehiclepositions"]), \
-                patch("rebuild_parquet.all_dates_for", return_value=[self.date, utc_iso()[:10], tomorrow]), \
-                patch("rebuild_parquet.rebuild_one", return_value={"raw_records": 1, "rows": 1, "previous_partition": None}) as run, \
+                patch("bkk_collector.cli.rebuild_parquet.all_dates_for", return_value=[self.date, utc_iso()[:10], tomorrow]), \
+                patch("bkk_collector.cli.rebuild_parquet.rebuild_one", return_value={"raw_records": 1, "rows": 1, "previous_partition": None}) as run, \
                 patch("sys.stdout", io.StringIO()):
             self.assertEqual(0, rebuild_parquet.main())
             self.assertEqual(1, run.call_count)
@@ -898,8 +898,8 @@ class CoverageAndRestoreTests(ReadinessFixture):
         atomic_write_json(receipt_path, {"version": 2, "date": date, "repo_id": "owner/archive",
                                        "remote_verified": True, "artifacts": artifacts})
         manager = Mock(data_dir=self.data, repo_id="owner/archive")
-        with patch("verify_backup.receipt_revision", return_value="b" * 40), \
-                patch("verify_backup.restore_artifact", side_effect=lambda _m, artifact, _r, path:
+        with patch("bkk_collector.cli.verify_backup.receipt_revision", return_value="b" * 40), \
+                patch("bkk_collector.cli.verify_backup.restore_artifact", side_effect=lambda _m, artifact, _r, path:
                       (path.write_bytes(b"temporary"), {"path": artifact["path"], "result": "PASS"})[1]):
             result = verify_day(manager, date)
         restored = [entry["path"] for entry in result["restored"]]
