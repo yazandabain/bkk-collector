@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { handle, type Environment } from '../worker/index'
-import { snapshotAt } from './fixture'
+import { fleetAt, snapshotAt } from './fixture'
 
 const secret = 'synthetic-test-secret-'.repeat(3)
 class MemoryBucket {
@@ -37,6 +37,23 @@ describe('public Worker boundary', () => {
     const result = await handle(new Request('https://example.invalid/api/snapshot'), env)
     expect(await result.json()).toEqual(value)
     expect(result.headers.get('Cache-Control')).toBe('public, max-age=10')
+    expect(bucket.writes).toBe(1)
+  })
+  it('publishes a full fleet without dropping features or leaking discarded JSON values', async () => {
+    const value = fleetAt()
+    const body = JSON.stringify(value).replace('{', '{"vehicles":{"api_key":"hidden-secret"},')
+    const request = new Request('https://example.invalid/api/publish', {
+      method: 'PUT', headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' }, body,
+    })
+    expect((await handle(request, env)).status).toBe(204)
+    const result = await handle(new Request('https://example.invalid/api/snapshot'), env)
+    expect(await result.json()).toEqual(value)
+    expect(bucket.payload).not.toContain('hidden-secret')
+    expect(bucket.payload).not.toContain('api_key')
+    const previous = bucket.payload
+    Object.assign(value.vehicles.features.at(-1)!.geometry, { private_path: 'private' })
+    expect((await handle(publish(value), env)).status).toBe(400)
+    expect(bucket.payload).toBe(previous)
     expect(bucket.writes).toBe(1)
   })
   it('a missing secret and invalid tokens never write', async () => {

@@ -1,17 +1,18 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { isSnapshot } from '../shared/snapshot'
 import { age, ageLabel, coverage, effectiveState } from '../src/format'
-import { snapshotAt } from './fixture'
+import { fleetAt, snapshotAt } from './fixture'
 
 describe('closed public snapshot', () => {
   it('accepts optional fields, all transport modes and known advisories', () => {
     expect(isSnapshot(snapshotAt())).toBe(true)
   })
   it('rejects extra private fields at every boundary', () => {
-    for (const path of ['', 'health', 'statistics', 'vehicles', 'feature', 'properties', 'feed', 'maintenance']) {
+    for (const path of ['', 'health', 'statistics', 'vehicles', 'feature', 'geometry', 'properties', 'feed', 'maintenance']) {
       const value = snapshotAt()
       const targets: Record<string, object> = { '': value, health: value.health, statistics: value.statistics,
-        vehicles: value.vehicles, feature: value.vehicles.features[0], properties: value.vehicles.features[0].properties,
+        vehicles: value.vehicles, feature: value.vehicles.features[0], geometry: value.vehicles.features[0].geometry,
+        properties: value.vehicles.features[0].properties,
         feed: value.health.feeds.tripupdates, maintenance: value.health.maintenance }
       Object.assign(targets[path], { private_error: 'must never publish' })
       expect(isSnapshot(value), path).toBe(false)
@@ -36,6 +37,43 @@ describe('closed public snapshot', () => {
     const value = snapshotAt()
     Object.assign(value.health, { state: ['healthy'] })
     expect(isSnapshot(value)).toBe(false)
+  })
+  it('validates repeated fleet timestamps once per distinct value, not once per vehicle', () => {
+    const value = fleetAt()
+    const timestamps = ['2026-10-02T12:00:01Z', '2026-10-02T12:00:02Z']
+    value.vehicles.features.forEach((feature, index) => { feature.properties.recorded_at = timestamps[index % timestamps.length] })
+    const parse = vi.spyOn(Date, 'parse')
+    try {
+      expect(isSnapshot(value)).toBe(true)
+      for (const timestamp of timestamps) expect(parse.mock.calls.filter(([argument]) => argument === timestamp)).toHaveLength(1)
+      // No cross-request cache or stale validation state.
+      expect(isSnapshot(value)).toBe(true)
+      for (const timestamp of timestamps) expect(parse.mock.calls.filter(([argument]) => argument === timestamp)).toHaveLength(2)
+    } finally { parse.mockRestore() }
+  })
+  it('still checks the final vehicle for private fields, duplicate IDs and missing keys', () => {
+    for (const change of [
+      (value: ReturnType<typeof fleetAt>) => { Object.assign(value.vehicles.features.at(-1)!.properties, { api_key: 'private' }) },
+      (value: ReturnType<typeof fleetAt>) => { value.vehicles.features.at(-1)!.id = value.vehicles.features[0].id },
+      (value: ReturnType<typeof fleetAt>) => { Reflect.deleteProperty(value.vehicles.features.at(-1)!.properties, 'recorded_at') },
+    ]) {
+      const value = fleetAt()
+      change(value)
+      expect(isSnapshot(value)).toBe(false)
+    }
+  })
+  it('retains strict calendar validation for repeated fleet timestamps', () => {
+    const value = fleetAt()
+    for (const [timestamp, valid] of [
+      ['2024-02-29T00:00:00Z', true], ['2026-02-29T00:00:00Z', false],
+      ['2026-04-31T00:00:00Z', false], ['2026-10-02T24:00:00Z', false],
+      ['2026-10-02T12:00:00.000Z', false], ['2026-10-02T12:00:00+00:00', false],
+    ] as const) {
+      value.vehicles.features.forEach(feature => { feature.properties.recorded_at = timestamp })
+      expect(isSnapshot(value), timestamp).toBe(valid)
+    }
+    value.vehicles.features.forEach(feature => { feature.properties.recorded_at = null })
+    expect(isSnapshot(value)).toBe(true)
   })
 })
 
