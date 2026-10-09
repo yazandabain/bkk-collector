@@ -23,3 +23,16 @@ export function snapshotAt(time = Date.now()): Snapshot {
     }, public_layer_issues: [],
   }
 }
+
+/** Repeated source timestamps and unique map IDs, as in a full fleet snapshot. */
+export function fleetAt(size = 2000, time = Date.now()): Snapshot {
+  const value = snapshotAt(time)
+  const templates = value.vehicles.features
+  value.vehicles.features = Array.from({ length: size }, (_, index) => {
+    const feature = structuredClone(templates[index % templates.length])
+    feature.id = index.toString(16).padStart(20, '0')
+    return feature
+  })
+  value.vehicles.records_in_source = size
+  return value
+}

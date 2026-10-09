@@ -51,12 +51,20 @@ export interface Snapshot {
 }
 
 function object(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-    && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key))
+  if (typeof value !== 'object' || value === null || Array.isArray(value)
+      || Object.keys(value).length !== keys.length) return false
+  for (const key of keys) if (!Object.hasOwn(value, key)) return false
+  return true
 }
-function timestamp(value: unknown, nullable = true): boolean {
-  return (nullable && value === null) || (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)
-    && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value.replace('Z', '.000Z'))
+function timestamp(value: unknown, nullable = true, cache?: Map<string, boolean>): boolean {
+  if (value === null) return nullable
+  if (typeof value !== 'string') return false
+  const cached = cache?.get(value)
+  if (cached !== undefined) return cached
+  const valid = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)
+    && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value.replace('Z', '.000Z')
+  cache?.set(value, valid)
+  return valid
 }
 function date(value: unknown): boolean {
   return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && timestamp(value + 'T00:00:00Z', false)
@@ -70,16 +78,20 @@ function finite(value: unknown, min: number, max: number): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max
 }
 
-function vehicle(value: unknown): boolean {
-  if (!object(value, ['type', 'id', 'geometry', 'properties']) || value.type !== 'Feature'
+const featureKeys = ['type', 'id', 'geometry', 'properties'] as const
+const pointKeys = ['type', 'coordinates'] as const
+const propertyKeys = ['route_label', 'mode', 'color', 'bearing', 'recorded_at'] as const
+
+function vehicle(value: unknown, timestamps: Map<string, boolean>): boolean {
+  if (!object(value, featureKeys) || value.type !== 'Feature'
       || typeof value.id !== 'string' || !/^[a-f0-9]{20}$/.test(value.id)) return false
   const point = value.geometry, properties = value.properties
-  if (!object(point, ['type', 'coordinates']) || point.type !== 'Point' || !Array.isArray(point.coordinates)
+  if (!object(point, pointKeys) || point.type !== 'Point' || !Array.isArray(point.coordinates)
       || point.coordinates.length !== 2 || !finite(point.coordinates[0], -180, 180) || !finite(point.coordinates[1], -90, 90)) return false
-  return object(properties, ['route_label', 'mode', 'color', 'bearing', 'recorded_at'])
+  return object(properties, propertyKeys)
     && typeof properties.route_label === 'string' && properties.route_label.length <= 48
     && modes.includes(properties.mode as Mode) && typeof properties.color === 'string' && /^#[a-f0-9]{6}$/.test(properties.color)
-    && (properties.bearing === null || finite(properties.bearing, 0, 360)) && timestamp(properties.recorded_at)
+    && (properties.bearing === null || finite(properties.bearing, 0, 360)) && timestamp(properties.recorded_at, true, timestamps)
 }
 function feedHealth(value: unknown): boolean {
   return object(value, ['state', 'observed_at', 'source_at', 'cadence_seconds', 'entities', 'issues'])
@@ -100,9 +112,15 @@ export function isSnapshot(value: unknown): value is Snapshot {
   if (!object(vehicles, ['type', 'observed_at', 'source_at', 'records_in_source', 'omitted_records', 'features'])
       || vehicles.type !== 'FeatureCollection' || !timestamp(vehicles.observed_at) || !timestamp(vehicles.source_at)
       || !count(vehicles.records_in_source) || !count(vehicles.omitted_records) || !Array.isArray(vehicles.features)
-      || vehicles.features.length > 10000 || !vehicles.features.every(vehicle)
-      || vehicles.features.length + vehicles.omitted_records !== vehicles.records_in_source
-      || new Set(vehicles.features.map(item => item.id)).size !== vehicles.features.length) return false
+      || vehicles.features.length > 10000
+      || vehicles.features.length + vehicles.omitted_records !== vehicles.records_in_source) return false
+  // Fleet timestamps repeat across many vehicles. Validate each distinct value
+  // once per snapshot, never across requests; keep every schema/privacy check.
+  const timestamps = new Map<string, boolean>(), ids = new Set<string>()
+  for (const feature of vehicles.features) {
+    if (!vehicle(feature, timestamps) || ids.has(feature.id)) return false
+    ids.add(feature.id)
+  }
   if (!object(health, ['state', 'observed_at', 'feeds', 'maintenance']) || !state(health.state) || !timestamp(health.observed_at)) return false
   const feeds = health.feeds
   if (!object(feeds, feedNames) || !feedNames.every(name => feedHealth(feeds[name]))) return false
