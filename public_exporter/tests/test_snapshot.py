@@ -13,6 +13,7 @@ from google.transit import gtfs_realtime_pb2 as pb
 
 from bkk_collector.storage.atomic_io import atomic_write_json
 from public_exporter.__main__ import PublishError, main, publish
+from public_exporter.transport import COMPACT_MEDIA_TYPE, encode_publication
 from public_exporter.snapshot import FEEDS, SnapshotBuilder, health, statistics
 from public_exporter.source import HEADER, LatestVehicleFrame, RouteCatalog, mode_for
 from bkk_collector.storage.raw_log import append_record
@@ -195,7 +196,7 @@ class PublicSnapshotTests(unittest.TestCase):
         session = Mock()
         session.put.return_value.status_code = 302
         with self.assertRaisesRegex(RuntimeError, "snapshot publish refused"):
-            publish(session, "https://example.invalid/api/publish", "secret", {"schema_version": 1})
+            publish(session, "https://example.invalid/api/publish", "secret", SnapshotBuilder(self.root).build(NOW))
         self.assertEqual(session.put.call_args.kwargs["timeout"], (3, 7))
         self.assertFalse(session.put.call_args.kwargs["allow_redirects"])
 
@@ -204,10 +205,52 @@ class PublicSnapshotTests(unittest.TestCase):
         session.put.return_value.status_code = 500
         session.put.return_value.text = "remote private/path?token=secret"
         with self.assertRaises(PublishError) as caught:
-            publish(session, "https://example.invalid/api/publish", "secret", {"schema_version": 1})
+            publish(session, "https://example.invalid/api/publish", "secret", SnapshotBuilder(self.root).build(NOW))
         self.assertEqual(caught.exception.status_code, 500)
         self.assertEqual(str(caught.exception), "snapshot publish refused (HTTP 500)")
         session.put.return_value.json.assert_not_called()
+
+    def test_compact_publication_preserves_all_values_without_mutating_local_geojson(self):
+        self.append()
+        self.catalog()
+        snapshot = SnapshotBuilder(self.root).build(NOW)
+        feature = snapshot["vehicles"]["features"][0]
+        feature["properties"]["route_label"] = "Őrjárat 🚋"
+        before = json.dumps(snapshot, ensure_ascii=False)
+        result = json.loads(encode_publication(snapshot))
+        self.assertEqual(json.dumps(snapshot, ensure_ascii=False), before)
+        self.assertEqual(result["vehicles"]["features"], [[feature["id"], *feature["geometry"]["coordinates"],
+            "Őrjárat 🚋", "bus", "#009fe3", None, feature["properties"]["recorded_at"]]])
+        result["vehicles"]["features"] = snapshot["vehicles"]["features"]
+        self.assertEqual(result, snapshot)
+        session = Mock()
+        session.put.return_value.status_code = 204
+        publish(session, "https://example.invalid/api/publish", "secret", snapshot)
+        self.assertEqual(session.put.call_args.kwargs["headers"]["Content-Type"], COMPACT_MEDIA_TYPE)
+        self.assertEqual(session.put.call_args.kwargs["data"], encode_publication(snapshot))
+
+    def test_compact_encoder_refuses_extra_private_fields_instead_of_hiding_projection_errors(self):
+        for boundary in ("feature", "geometry", "properties"):
+            self.append()
+            snapshot = SnapshotBuilder(self.root).build(NOW)
+            feature = snapshot["vehicles"]["features"][0]
+            target = feature if boundary == "feature" else feature[boundary]
+            target["api_key"] = "private"
+            with self.assertRaisesRegex(ValueError, "unexpected public vehicle shape"):
+                encode_publication(snapshot)
+
+    def test_compact_encoder_refuses_wrong_geometry_and_nonfinite_values(self):
+        self.append()
+        for mutate in (
+            lambda feature: feature.update(type="private"),
+            lambda feature: feature["geometry"].update(type="LineString"),
+            lambda feature: feature["geometry"].update(coordinates=[19.0]),
+            lambda feature: feature["geometry"].update(coordinates=[float("nan"), 47.5]),
+        ):
+            snapshot = SnapshotBuilder(self.root).build(NOW)
+            mutate(snapshot["vehicles"]["features"][0])
+            with self.assertRaises(ValueError):
+                encode_publication(snapshot)
 
     def test_failed_publish_logs_status_and_marks_public_layer_unhealthy_without_secrets(self):
         output = self.root / "output"

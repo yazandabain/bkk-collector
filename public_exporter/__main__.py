@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import signal
@@ -16,6 +15,7 @@ import requests
 
 from bkk_collector.storage.atomic_io import atomic_write_json
 from public_exporter.snapshot import SnapshotBuilder, iso
+from public_exporter.transport import COMPACT_MEDIA_TYPE, encode_publication
 
 
 class PublishError(RuntimeError):
@@ -27,10 +27,10 @@ class PublishError(RuntimeError):
 
 
 def publish(session: requests.Session, url: str, token: str, snapshot: dict) -> None:
-    payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+    payload = encode_publication(snapshot)
     if len(payload) > 2 * 1024 * 1024:
         raise ValueError("snapshot exceeds publish limit")
-    response = session.put(url, data=payload, headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+    response = session.put(url, data=payload, headers={"Authorization": "Bearer " + token, "Content-Type": COMPACT_MEDIA_TYPE},
                            timeout=(3, 7), allow_redirects=False)
     if response.status_code != 204:
         raise PublishError(response.status_code)

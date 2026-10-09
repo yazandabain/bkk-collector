@@ -28,6 +28,15 @@ separate machine token, writes a fixed object key and refuses older snapshots.
 Conditional R2 writes prevent a competing publication from overwriting a newer
 object. There is no public control endpoint or arbitrary object access.
 
+The private upload uses `application/vnd.bkk-observatory.snapshot.v1+json`:
+each vehicle is an eight-field tuple `[id, longitude, latitude, route_label,
+mode, color, bearing, recorded_at]`. This avoids thousands of repeated GeoJSON
+keys in the free Worker's CPU-limited ingress path. Every field is validated;
+the Worker expands and stores canonical GeoJSON. Local exporter output and
+`/api/snapshot` remain schema version 1; stored/public JSON is capped at 2 MiB
+of UTF-8. Old `application/json` publishers are still accepted. Deploy the dual-format Worker
+before updating the exporter; there is no collector or historical-data migration.
+
 - Vehicle data comes from the latest **checkpointed** raw VehiclePositions
   frame. The exporter seeks through record headers once and reads only new
   committed frames afterward; it never repairs the source. It decompresses only
@@ -195,3 +204,6 @@ Rollback the public layer independently: redeploy a previously verified frontend
 revision, or stop only `public-exporter` with the Compose overlay. The site will
 mark the last snapshot stale. Keep the collector and maintenance running, and do
 not delete collected data, receipts or version history as part of rollback.
+If rolling the Worker back to a version before compact uploads were supported,
+first restore the matching older exporter image or stop the exporter; otherwise
+uploads will safely fail with HTTP 415 until their formats agree.
