@@ -16,6 +16,17 @@ const KEY = 'latest.json'
 const MAX_BYTES = 2 * 1024 * 1024
 const noCache = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }
 
+function matchesSnapshotEtag(header: string | null, etag: string): boolean {
+  if (!header) return false
+  if (header.trim() === '*') return true
+  // Conditional GET/HEAD uses weak comparison, including Cloudflare's
+  // compressed-response ETags. Quoted tags may themselves contain commas.
+  for (const match of header.matchAll(/(?:^|,)[\t ]*(?:W\/)?("[\x21\x23-\x7e\x80-\xff]*")[\t ]*(?=,|$)/g)) {
+    if (match[1] === etag) return true
+  }
+  return false
+}
+
 async function authorized(header: string | null, secret: string | undefined): Promise<boolean> {
   if (!secret || secret.length < 32 || !header?.startsWith('Bearer ') || header.length > 512) return false
   const encoder = new TextEncoder()
@@ -56,7 +67,7 @@ export async function handle(request: Request, env: Environment): Promise<Respon
       if (!object) return new Response('Snapshot unavailable', { status: 503, headers: { ...noCache, 'Retry-After': '15' } })
       const headers = new Headers({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'public, max-age=10',
         'ETag': object.httpEtag, 'X-Content-Type-Options': 'nosniff' })
-      if (request.headers.get('If-None-Match') === object.httpEtag) return new Response(null, { status: 304, headers })
+      if (matchesSnapshotEtag(request.headers.get('If-None-Match'), object.httpEtag)) return new Response(null, { status: 304, headers })
       return new Response(request.method === 'HEAD' ? null : object.body, { headers })
     }
     if (path === '/api/publish' && request.method === 'PUT') {
