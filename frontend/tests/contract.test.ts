@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
-import { isSnapshot } from '../shared/snapshot'
+import { decodeCompactSnapshot, isSnapshot, modes } from '../shared/snapshot'
 import { age, ageLabel, coverage, effectiveState } from '../src/format'
-import { fleetAt, snapshotAt } from './fixture'
+import { compactSnapshot, fleetAt, snapshotAt } from './fixture'
 
 describe('closed public snapshot', () => {
   it('accepts optional fields, all transport modes and known advisories', () => {
@@ -74,6 +74,42 @@ describe('closed public snapshot', () => {
     }
     value.vehicles.features.forEach(feature => { feature.properties.recorded_at = null })
     expect(isSnapshot(value)).toBe(true)
+  })
+})
+
+describe('compact publication contract', () => {
+  it('round-trips every mode and nullable field without changing public schema', () => {
+    const value = fleetAt(modes.length)
+    value.vehicles.features.forEach((feature, index) => { feature.properties.mode = modes[index] })
+    expect(decodeCompactSnapshot(compactSnapshot(value))).toEqual(value)
+    expect(decodeCompactSnapshot(compactSnapshot(fleetAt(0)))).toEqual(fleetAt(0))
+  })
+  it('rejects invalid tuples, late duplicate IDs, private metadata and count mismatches', () => {
+    for (const mutate of [
+      (value: ReturnType<typeof compactSnapshot>) => { value.vehicles.features.at(-1)!.push('private') },
+      (value: ReturnType<typeof compactSnapshot>) => { value.vehicles.features.at(-1)!.pop() },
+      (value: ReturnType<typeof compactSnapshot>) => { value.vehicles.features.at(-1)![0] = value.vehicles.features[0][0] },
+      (value: ReturnType<typeof compactSnapshot>) => { value.vehicles.features.at(-1)![1] = Infinity },
+      (value: ReturnType<typeof compactSnapshot>) => { value.vehicles.features.at(-1)![2] = -91 },
+      (value: ReturnType<typeof compactSnapshot>) => { value.vehicles.features.at(-1)![3] = 'x'.repeat(49) },
+      (value: ReturnType<typeof compactSnapshot>) => { value.vehicles.features.at(-1)![4] = 'unknown-mode' },
+      (value: ReturnType<typeof compactSnapshot>) => { value.vehicles.features.at(-1)![5] = 'url(private)' },
+      (value: ReturnType<typeof compactSnapshot>) => { value.vehicles.features.at(-1)![6] = -1 },
+      (value: ReturnType<typeof compactSnapshot>) => { value.vehicles.features.at(-1)![7] = '2026-02-30T00:00:00Z' },
+      (value: ReturnType<typeof compactSnapshot>) => { Object.assign(value.health.feeds.alerts, { private_error: 'private' }) },
+      (value: ReturnType<typeof compactSnapshot>) => { value.vehicles.omitted_records++ },
+    ]) {
+      const value = compactSnapshot(fleetAt())
+      mutate(value)
+      expect(decodeCompactSnapshot(value)).toBeNull()
+    }
+    const row = compactSnapshot(snapshotAt()).vehicles.features[0]
+    for (const index of [0, 1, 2, 3, 4, 5, 6, 7]) {
+      const value = compactSnapshot(snapshotAt())
+      value.vehicles.features[0] = [...row]
+      Object.assign(value.vehicles.features[0], { [index]: { api_key: 'private' } })
+      expect(decodeCompactSnapshot(value)).toBeNull()
+    }
   })
 })
 

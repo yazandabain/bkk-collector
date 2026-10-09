@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { handle, type Environment } from '../worker/index'
-import { fleetAt, snapshotAt } from './fixture'
+import { compactMediaType } from '../shared/snapshot'
+import { compactSnapshot, fleetAt, snapshotAt } from './fixture'
 
 const secret = 'synthetic-test-secret-'.repeat(3)
 class MemoryBucket {
@@ -13,11 +14,12 @@ class MemoryBucket {
     return this.payload ? { httpEtag: '"test-etag"', body: new Response(this.payload).body! } : null
   }
   async head(key: string) { expect(key).toBe('latest.json'); return this.payload ? { etag: 'test-etag', customMetadata: { generated: this.generation } } : null }
-  async put(key: string, payload: string, options: Parameters<Environment['SNAPSHOTS']['put']>[2]) {
+  async put(key: string, payload: string | Uint8Array, options: Parameters<Environment['SNAPSHOTS']['put']>[2]) {
     expect(key).toBe('latest.json')
     expect(options.onlyIf).toEqual(this.payload ? { etagMatches: 'test-etag' } : { etagDoesNotMatch: '*' })
     if (this.conflict) return null
-    this.payload = payload; this.generation = options.customMetadata.generated; this.writes++
+    this.payload = typeof payload === 'string' ? payload : new TextDecoder().decode(payload)
+    this.generation = options.customMetadata.generated; this.writes++
     return { etag: 'test-etag' }
   }
 }
@@ -56,6 +58,41 @@ describe('public Worker boundary', () => {
     expect(bucket.payload).toBe(previous)
     expect(bucket.writes).toBe(1)
   })
+  it('compact publication returns exactly the same public GeoJSON and accepts old publishers', async () => {
+    const value = fleetAt()
+    value.vehicles.features[0].properties.route_label = 'Őrjárat 🚋'
+    expect((await handle(publish(compactSnapshot(value), secret, compactMediaType), env)).status).toBe(204)
+    expect(await (await handle(new Request('https://example.invalid/api/snapshot'), env)).json()).toEqual(value)
+    expect((await handle(publish(value), env)).status).toBe(204)
+    expect(JSON.parse(bucket.payload!)).toEqual(value)
+    expect(bucket.writes).toBe(2)
+  })
+  it('compact publication still refuses stale data and preserves conditional-write conflicts', async () => {
+    expect((await handle(publish(compactSnapshot(fleetAt(2000, Date.now() - 180000)), secret, compactMediaType), env)).status).toBe(400)
+    bucket.conflict = true
+    expect((await handle(publish(compactSnapshot(fleetAt()), secret, compactMediaType), env)).status).toBe(412)
+    expect(bucket.writes).toBe(0)
+  })
+  it('compact duplicate JSON metadata cannot leak discarded private values', async () => {
+    const value = compactSnapshot(snapshotAt())
+    const body = JSON.stringify(value).replace('{', '{"health":{"api_key":"hidden-secret"},')
+    const request = new Request('https://example.invalid/api/publish', {
+      method: 'PUT', headers: { Authorization: 'Bearer ' + secret, 'Content-Type': compactMediaType }, body,
+    })
+    expect((await handle(request, env)).status).toBe(204)
+    expect(JSON.parse(bucket.payload!)).toEqual(snapshotAt(Date.parse(value.generated_at)))
+    expect(bucket.payload).not.toContain('hidden-secret')
+  })
+  it('limits expanded public UTF-8 bytes, not just compact input or string length', async () => {
+    const value = fleetAt(7000)
+    value.vehicles.features.forEach(feature => { feature.properties.route_label = 'ű'.repeat(48) })
+    const compact = compactSnapshot(value)
+    expect(new TextEncoder().encode(JSON.stringify(compact)).byteLength).toBeLessThan(2 * 1024 * 1024)
+    expect(JSON.stringify(value).length).toBeLessThan(2 * 1024 * 1024)
+    expect(new TextEncoder().encode(JSON.stringify(value)).byteLength).toBeGreaterThan(2 * 1024 * 1024)
+    expect((await handle(publish(compact, secret, compactMediaType), env)).status).toBe(413)
+    expect(bucket.writes).toBe(0)
+  })
   it('a missing secret and invalid tokens never write', async () => {
     env.PUBLISH_TOKEN = undefined
     expect((await handle(publish(snapshotAt(), 'undefined'), env)).status).toBe(401)
@@ -81,6 +118,7 @@ describe('public Worker boundary', () => {
   it('rejects oversized actual bodies and wrong media types', async () => {
     expect((await handle(publish('a'.repeat(2 * 1024 * 1024)), env)).status).toBe(413)
     expect((await handle(publish(snapshotAt(), secret, 'text/plain'), env)).status).toBe(415)
+    expect((await handle(publish(compactSnapshot(snapshotAt()), secret, compactMediaType.replace('.v1+', '.v2+')), env)).status).toBe(415)
     expect(bucket.writes).toBe(0)
   })
   it('stale upload and conditional write conflicts never replace the object', async () => {
