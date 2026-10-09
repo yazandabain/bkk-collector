@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 from google.transit import gtfs_realtime_pb2 as pb
 
 from bkk_collector.storage.atomic_io import atomic_write_json
-from public_exporter.__main__ import publish
+from public_exporter.__main__ import PublishError, main, publish
 from public_exporter.snapshot import FEEDS, SnapshotBuilder, health, statistics
 from public_exporter.source import HEADER, LatestVehicleFrame, RouteCatalog, mode_for
 from bkk_collector.storage.raw_log import append_record
@@ -198,6 +198,40 @@ class PublicSnapshotTests(unittest.TestCase):
             publish(session, "https://example.invalid/api/publish", "secret", {"schema_version": 1})
         self.assertEqual(session.put.call_args.kwargs["timeout"], (3, 7))
         self.assertFalse(session.put.call_args.kwargs["allow_redirects"])
+
+    def test_publish_error_reports_only_http_status_without_reading_remote_body(self):
+        session = Mock()
+        session.put.return_value.status_code = 500
+        session.put.return_value.text = "remote private/path?token=secret"
+        with self.assertRaises(PublishError) as caught:
+            publish(session, "https://example.invalid/api/publish", "secret", {"schema_version": 1})
+        self.assertEqual(caught.exception.status_code, 500)
+        self.assertEqual(str(caught.exception), "snapshot publish refused (HTTP 500)")
+        session.put.return_value.json.assert_not_called()
+
+    def test_failed_publish_logs_status_and_marks_public_layer_unhealthy_without_secrets(self):
+        output = self.root / "output"
+        with patch("sys.argv", ["public-exporter", "--once", "--output", str(output)]), \
+             patch.dict("os.environ", {"PUBLIC_PUBLISH_URL": "https://example.invalid/api/publish", "PUBLIC_PUBLISH_TOKEN": "secret-" * 8}), \
+             patch("public_exporter.__main__.signal.signal"), \
+             patch("public_exporter.__main__.SnapshotBuilder") as builder, \
+             patch("public_exporter.__main__.publish", side_effect=PublishError(500)), \
+             self.assertLogs(level="ERROR") as captured:
+            builder.return_value.build.return_value = {"schema_version": 1}
+            self.assertEqual(main(), 1)
+        self.assertEqual(captured.output, ["ERROR:root:Public snapshot failed (HTTP 500); retrying next tick"])
+        self.assertFalse(json.loads((output / "status.json").read_text())["healthy"])
+
+    def test_network_error_log_does_not_disclose_endpoint_or_token(self):
+        with patch("sys.argv", ["public-exporter", "--once", "--output", str(self.root / "output")]), \
+             patch.dict("os.environ", {"PUBLIC_PUBLISH_URL": "https://example.invalid/api/publish", "PUBLIC_PUBLISH_TOKEN": "secret-" * 8}), \
+             patch("public_exporter.__main__.signal.signal"), \
+             patch("public_exporter.__main__.SnapshotBuilder") as builder, \
+             patch("public_exporter.__main__.publish", side_effect=ConnectionError("private/path?token=secret")), \
+             self.assertLogs(level="ERROR") as captured:
+            builder.return_value.build.return_value = {"schema_version": 1}
+            self.assertEqual(main(), 1)
+        self.assertEqual(captured.output, ["ERROR:root:Public snapshot failed (ConnectionError); retrying next tick"])
 
     def test_statistics_memory_does_not_accumulate_private_artifact_lists(self):
         for day in range(1, 31):

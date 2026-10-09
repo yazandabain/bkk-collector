@@ -18,6 +18,14 @@ from bkk_collector.storage.atomic_io import atomic_write_json
 from public_exporter.snapshot import SnapshotBuilder, iso
 
 
+class PublishError(RuntimeError):
+    """A refused upload, exposing only its numeric HTTP status."""
+
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+        super().__init__(f"snapshot publish refused (HTTP {status_code})")
+
+
 def publish(session: requests.Session, url: str, token: str, snapshot: dict) -> None:
     payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
     if len(payload) > 2 * 1024 * 1024:
@@ -25,7 +33,7 @@ def publish(session: requests.Session, url: str, token: str, snapshot: dict) -> 
     response = session.put(url, data=payload, headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
                            timeout=(3, 7), allow_redirects=False)
     if response.status_code != 204:
-        raise RuntimeError("snapshot publish refused")
+        raise PublishError(response.status_code)
 
 
 def main() -> int:
@@ -60,6 +68,8 @@ def main() -> int:
                 if not args.no_publish:
                     publish(session, url, token, snapshot)
                 success = True
+            except PublishError as exc:
+                logging.error("Public snapshot failed (HTTP %d); retrying next tick", exc.status_code)
             except Exception as exc:
                 # requests exceptions may contain authenticated endpoints.
                 logging.error("Public snapshot failed (%s); retrying next tick", type(exc).__name__)

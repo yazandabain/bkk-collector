@@ -105,6 +105,14 @@ and public reads; static assets have separate free serving. A popular site may
 exhaust the free dynamic allowance and show stale data without affecting ingestion.
 Do not enable a paid subscription automatically to mask that condition.
 
+Free Workers also has a 10 ms CPU budget per request; network waits do not count.
+Publication validates every vehicle, but reuses validation of repeated source
+timestamps within each snapshot. Check Worker CPU percentiles and
+`exceededResources` outcomes as well as request totals, especially at peak fleet
+size. A CPU-limit failure interrupts public publication, not research ingestion.
+The publisher logs refused uploads by HTTP status only; it never logs response
+bodies, authenticated URLs or tokens. See [Worker limits](https://developers.cloudflare.com/workers/platform/limits/).
+
 ```bash
 cd frontend
 npm ci
