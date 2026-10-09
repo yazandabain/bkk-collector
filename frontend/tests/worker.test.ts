@@ -139,6 +139,27 @@ describe('public Worker boundary', () => {
     expect(result.status).toBe(304)
     expect(await result.text()).toBe('')
   })
+  it('honors compressed-response weak ETags, lists and wildcards for GET and HEAD', async () => {
+    await handle(publish(snapshotAt()), env)
+    const previous = bucket.payload
+    for (const method of ['GET', 'HEAD']) {
+      for (const tag of ['W/"test-etag"', '"other", W/"test-etag"', 'W/"first,other", "test-etag"', '*']) {
+        const result = await handle(new Request('https://example.invalid/api/snapshot', {
+          method, headers: { 'If-None-Match': tag },
+        }), env)
+        expect(result.status, `${method} ${tag}`).toBe(304)
+        expect(await result.text()).toBe('')
+        expect(result.headers.get('ETag')).toBe('"test-etag"')
+      }
+      for (const tag of ['W/"different"', '"other", "different"', 'w/"test-etag"', 'test-etag']) {
+        expect((await handle(new Request('https://example.invalid/api/snapshot', {
+          method, headers: { 'If-None-Match': tag },
+        }), env)).status, `${method} ${tag}`).toBe(200)
+      }
+    }
+    expect(bucket.payload).toBe(previous)
+    expect(bucket.writes).toBe(1)
+  })
   it('unknown API paths cannot proxy arbitrary objects or assets', async () => {
     expect((await handle(new Request('https://example.invalid/api/private.json'), env)).status).toBe(404)
     expect((await handle(new Request('https://example.invalid/api/publish'), env)).status).toBe(404)
