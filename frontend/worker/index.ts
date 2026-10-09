@@ -1,10 +1,10 @@
-import { isSnapshot } from '../shared/snapshot'
+import { compactMediaType, decodeCompactSnapshot, isSnapshot } from '../shared/snapshot'
 
 export interface Environment {
   SNAPSHOTS: {
     get(key: string): Promise<{ httpEtag: string; body: ReadableStream<Uint8Array> } | null>
     head(key: string): Promise<{ etag: string; customMetadata?: Record<string, string> } | null>
-    put(key: string, value: string, options: {
+    put(key: string, value: string | Uint8Array, options: {
       httpMetadata: { contentType: string }; customMetadata: Record<string, string>
       onlyIf: { etagMatches: string } | { etagDoesNotMatch: string }
     }): Promise<unknown>
@@ -61,21 +61,25 @@ export async function handle(request: Request, env: Environment): Promise<Respon
     }
     if (path === '/api/publish' && request.method === 'PUT') {
       if (!await authorized(request.headers.get('Authorization'), env.PUBLISH_TOKEN)) return new Response('Unauthorized', { status: 401, headers: noCache })
-      if (request.headers.get('Content-Type')?.split(';')[0].trim() !== 'application/json') return new Response('JSON required', { status: 415, headers: noCache })
+      const mediaType = request.headers.get('Content-Type')?.split(';')[0].trim()
+      if (mediaType !== 'application/json' && mediaType !== compactMediaType) return new Response('JSON required', { status: 415, headers: noCache })
       let payload: string
       try { payload = await boundedBody(request) } catch (error) {
         return new Response('Invalid payload', { status: error instanceof RangeError ? 413 : 400, headers: noCache })
       }
-      let snapshot: unknown
-      try { snapshot = JSON.parse(payload) } catch { return new Response('Invalid JSON', { status: 400, headers: noCache }) }
-      if (!isSnapshot(snapshot)) return new Response('Invalid snapshot', { status: 400, headers: noCache })
+      let incoming: unknown
+      try { incoming = JSON.parse(payload) } catch { return new Response('Invalid JSON', { status: 400, headers: noCache }) }
+      const snapshot = mediaType === compactMediaType ? decodeCompactSnapshot(incoming) : isSnapshot(incoming) ? incoming : null
+      if (!snapshot) return new Response('Invalid snapshot', { status: 400, headers: noCache })
       const generated = Date.parse(snapshot.generated_at)
       if (Math.abs(Date.now() - generated) > 120000) return new Response('Snapshot time invalid', { status: 400, headers: noCache })
+      // Canonical bytes remove discarded duplicate JSON values and keep the
+      // original public size limit even when the private transfer is compact.
+      const canonical = new TextEncoder().encode(JSON.stringify(snapshot))
+      if (canonical.byteLength > MAX_BYTES) return new Response('Invalid payload', { status: 413, headers: noCache })
       const previous = await env.SNAPSHOTS.head(KEY)
       if (previous && Number(previous.customMetadata?.generated) > generated) return new Response('Older snapshot refused', { status: 409, headers: noCache })
-      // Re-serialize the validated value. Storing the original JSON could leak
-      // hidden earlier values of duplicate keys that JSON.parse superseded.
-      const result = await env.SNAPSHOTS.put(KEY, JSON.stringify(snapshot), {
+      const result = await env.SNAPSHOTS.put(KEY, canonical, {
         httpMetadata: { contentType: 'application/json; charset=utf-8' },
         customMetadata: { generated: String(generated) },
         onlyIf: previous ? { etagMatches: previous.etag } : { etagDoesNotMatch: '*' },

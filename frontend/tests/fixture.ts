@@ -36,3 +36,10 @@ export function fleetAt(size = 2000, time = Date.now()): Snapshot {
   value.vehicles.records_in_source = size
   return value
 }
+
+export function compactSnapshot(value: Snapshot) {
+  return { ...value, vehicles: { ...value.vehicles, features: value.vehicles.features.map(feature => [
+    feature.id, ...feature.geometry.coordinates, feature.properties.route_label, feature.properties.mode,
+    feature.properties.color, feature.properties.bearing, feature.properties.recorded_at,
+  ]) } }
+}

@@ -82,7 +82,7 @@ const featureKeys = ['type', 'id', 'geometry', 'properties'] as const
 const pointKeys = ['type', 'coordinates'] as const
 const propertyKeys = ['route_label', 'mode', 'color', 'bearing', 'recorded_at'] as const
 
-function vehicle(value: unknown, timestamps: Map<string, boolean>): boolean {
+function vehicle(value: unknown, timestamps: Map<string, boolean>): value is Vehicle {
   if (!object(value, featureKeys) || value.type !== 'Feature'
       || typeof value.id !== 'string' || !/^[a-f0-9]{20}$/.test(value.id)) return false
   const point = value.geometry, properties = value.properties
@@ -105,7 +105,11 @@ function dayCounts(value: unknown): boolean {
     && nullableCount(value.expected_polls) && nullableCount(value.recorded_polls) && nullableCount(value.data_polls)
 }
 
-export function isSnapshot(value: unknown): value is Snapshot {
+type SnapshotEnvelope = Omit<Snapshot, 'vehicles'> & {
+  vehicles: Omit<Snapshot['vehicles'], 'features'> & { features: unknown[] }
+}
+
+function envelope(value: unknown): value is SnapshotEnvelope {
   if (!object(value, ['schema_version', 'generated_at', 'vehicles', 'health', 'statistics', 'public_layer_issues'])
       || value.schema_version !== 1 || !timestamp(value.generated_at, false)) return false
   const vehicles = value.vehicles, health = value.health, stats = value.statistics
@@ -114,13 +118,6 @@ export function isSnapshot(value: unknown): value is Snapshot {
       || !count(vehicles.records_in_source) || !count(vehicles.omitted_records) || !Array.isArray(vehicles.features)
       || vehicles.features.length > 10000
       || vehicles.features.length + vehicles.omitted_records !== vehicles.records_in_source) return false
-  // Fleet timestamps repeat across many vehicles. Validate each distinct value
-  // once per snapshot, never across requests; keep every schema/privacy check.
-  const timestamps = new Map<string, boolean>(), ids = new Set<string>()
-  for (const feature of vehicles.features) {
-    if (!vehicle(feature, timestamps) || ids.has(feature.id)) return false
-    ids.add(feature.id)
-  }
   if (!object(health, ['state', 'observed_at', 'feeds', 'maintenance']) || !state(health.state) || !timestamp(health.observed_at)) return false
   const feeds = health.feeds
   if (!object(feeds, feedNames) || !feedNames.every(name => feedHealth(feeds[name]))) return false
@@ -139,4 +136,41 @@ export function isSnapshot(value: unknown): value is Snapshot {
   }
   return Array.isArray(value.public_layer_issues) && value.public_layer_issues.length <= 2
     && value.public_layer_issues.every(issue => ['route_catalog_unavailable', 'vehicle_snapshot_unavailable'].includes(issue))
+}
+
+export function isSnapshot(value: unknown): value is Snapshot {
+  if (!envelope(value)) return false
+  // Fleet timestamps repeat across many vehicles. Validate each distinct value
+  // once per snapshot, never across requests; keep every schema/privacy check.
+  const timestamps = new Map<string, boolean>(), ids = new Set<string>()
+  for (const feature of value.vehicles.features) {
+    if (!vehicle(feature, timestamps) || ids.has(feature.id)) return false
+    ids.add(feature.id)
+  }
+  return true
+}
+
+/** Private publication encoding only; the stored/browser contract stays GeoJSON. */
+export const compactMediaType = 'application/vnd.bkk-observatory.snapshot.v1+json'
+type VehicleTuple = [string, number, number, string, Mode, string, number | null, string | null]
+
+function vehicleTuple(value: unknown, timestamps: Map<string, boolean>): value is VehicleTuple {
+  return Array.isArray(value) && value.length === 8
+    && typeof value[0] === 'string' && /^[a-f0-9]{20}$/.test(value[0])
+    && finite(value[1], -180, 180) && finite(value[2], -90, 90)
+    && typeof value[3] === 'string' && value[3].length <= 48 && modes.includes(value[4] as Mode)
+    && typeof value[5] === 'string' && /^#[a-f0-9]{6}$/.test(value[5])
+    && (value[6] === null || finite(value[6], 0, 360)) && timestamp(value[7], true, timestamps)
+}
+
+export function decodeCompactSnapshot(value: unknown): Snapshot | null {
+  if (!envelope(value)) return null
+  const timestamps = new Map<string, boolean>(), ids = new Set<string>(), features: Vehicle[] = []
+  for (const row of value.vehicles.features) {
+    if (!vehicleTuple(row, timestamps) || ids.has(row[0])) return null
+    ids.add(row[0])
+    features.push({ type: 'Feature', id: row[0], geometry: { type: 'Point', coordinates: [row[1], row[2]] },
+      properties: { route_label: row[3], mode: row[4], color: row[5], bearing: row[6], recorded_at: row[7] } })
+  }
+  return { ...value, vehicles: { ...value.vehicles, features } }
 }
