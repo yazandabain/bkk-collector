@@ -87,6 +87,21 @@ INT_COLUMNS = {
 }
 MAX_SEGMENTS_PER_COMMIT = 20
 PARQUET_WRITE_BATCH_ROWS = 4096
+MAX_ALERT_SPOOL_STRING_BYTES = 128 * 1024 * 1024
+
+
+def check_alert_spool_size(rows: list[dict[str, Any]]) -> None:
+    """Refuse quadratic string expansion before allocating a full JSON copy.
+
+    A feed-wide alert can repeat a megabyte selector list in thousands of
+    flattened rows. Refusal uses the collector's existing fsynced raw fallback
+    and unhealthy storage flag instead of killing every feed with a cgroup OOM.
+    """
+    total = 0
+    for row in rows:
+        total += sum(len(value) for value in row.values() if isinstance(value, str))
+        if total > MAX_ALERT_SPOOL_STRING_BYTES:
+            raise ValueError("Alerts derived string expansion exceeds safe spool limit; raw fallback required")
 
 
 def parquet_schema(feed_name: str):
@@ -170,6 +185,8 @@ class DurableParquetSpool:
             return None
         if feed_name not in FEED_NAMES:
             raise ValueError(f"unknown feed: {feed_name}")
+        if feed_name == "alerts":
+            check_alert_spool_size(rows)
         segment_dir = self.spool_dir / feed_name / f"date={date_str}"
         safe_poll_id = "".join(character for character in poll_id if character.isalnum() or character in "-_")
         path = segment_dir / f"batch-{safe_poll_id}-{uuid.uuid4().hex}.json.gz"
