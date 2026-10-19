@@ -292,6 +292,7 @@ class Collector:
             "version": 1, "run_id": self.run_id, "started_at": utc_iso(),
             "collector_git_commit": os.environ.get("COLLECTOR_GIT_COMMIT", "unknown"),
             "schema_version": 2, "presence_version": 1, "presence_source_timestamps_version": 1,
+            "spool_format_versions": [1, 2],
             "poll_intervals_seconds": config.feed_intervals,
             "raw_archive_intervals_seconds": config.raw_archive_intervals,
             "trip_auxiliary_raw_policy": "full_response_on_auxiliary_state_change",

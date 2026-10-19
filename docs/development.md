@@ -59,6 +59,13 @@ metadata retains the deployed Git commit and existing schema identifiers.
 Collection frequency, tolerance and reconstruction limits are documented in
 [the collection policy](collection-policy.md).
 
+Internal spool readers accept versions 1 and 2. Version 2 stores large strings
+once in `shared_strings`; row cells use `{"$shared_string": index}` references.
+Readers restore the exact values before writing Parquet. This is not a research
+schema change. Do not roll a collector back to a version without this reader
+while version 2 segments are pending, and never delete unknown spool files to
+make a rollback start. Retain the files and use a compatible recovery image.
+
 CI builds and installs a wheel, checks imports outside the checkout, exercises
 the production images offline, and runs the existing backend/exporter/frontend
 suites. No data migration, production deployment or package publishing is

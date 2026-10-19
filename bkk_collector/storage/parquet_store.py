@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 from bkk_collector.storage.atomic_io import atomic_write_bytes, atomic_write_json, fsync_directory, read_json
 from bkk_collector.config import FEED_NAMES
+from bkk_collector.storage.spool_codec import restore_shared_strings, share_large_strings
 
 
 COMMON_COLUMNS = (
@@ -99,7 +100,8 @@ def check_alert_spool_size(rows: list[dict[str, Any]]) -> None:
     """
     total = 0
     for row in rows:
-        total += sum(len(value) for value in row.values() if isinstance(value, str))
+        # Four bytes per code point bounds UTF-8 without allocating encodings.
+        total += 4 * sum(len(value) for value in row.values() if isinstance(value, str))
         if total > MAX_ALERT_SPOOL_STRING_BYTES:
             raise ValueError("Alerts derived string expansion exceeds safe spool limit; raw fallback required")
 
@@ -123,11 +125,44 @@ def parquet_schema(feed_name: str):
     return pa.schema(fields, metadata={b"bkk_collector_schema_version": b"2", b"feed": feed_name.encode("ascii")})
 
 
-def rows_to_table(feed_name: str, rows: list[dict[str, Any]]):
+def dictionary_storage_schema(schema):
+    """An Arrow working schema; Parquet's readable logical schema stays strings."""
+    import pyarrow as pa
+
+    return pa.schema([
+        field.with_type(pa.dictionary(pa.int32(), pa.string())) if pa.types.is_string(field.type) else field
+        for field in schema
+    ], metadata=schema.metadata)
+
+
+def rows_to_table(feed_name: str, rows: list[dict[str, Any]], *, dictionary_strings: bool = False):
     import pyarrow as pa
 
     schema = parquet_schema(feed_name)
     columns = {name: [row.get(name) for row in rows] for name in PARQUET_COLUMNS[feed_name]}
+    if dictionary_strings:
+        schema = dictionary_storage_schema(schema)
+        arrays = []
+        for field in schema:
+            values = columns[field.name]
+            if pa.types.is_dictionary(field.type):
+                dictionary, indices, seen = [], [], {}
+                for value in values:
+                    if value is None:
+                        indices.append(None)
+                        continue
+                    index = seen.get(value)
+                    if index is None:
+                        index = len(dictionary)
+                        seen[value] = index
+                        dictionary.append(value)
+                    indices.append(index)
+                arrays.append(pa.DictionaryArray.from_arrays(
+                    pa.array(indices, type=pa.int32()), pa.array(dictionary, type=pa.string()),
+                ))
+            else:
+                arrays.append(pa.array(values, type=field.type))
+        return pa.Table.from_arrays(arrays, schema=schema)
     return pa.Table.from_pydict(columns, schema=schema)
 
 
@@ -138,9 +173,21 @@ def write_parquet_atomic(feed_name: str, rows, path: Path) -> None:
     temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
     try:
         iterator = iter(rows)
-        with pq.ParquetWriter(temporary, parquet_schema(feed_name), compression="zstd", write_statistics=True) as writer:
+        logical_schema = parquet_schema(feed_name)
+        dictionary_strings = feed_name == "alerts"
+        schema = dictionary_storage_schema(logical_schema) if dictionary_strings else logical_schema
+        # Repeated alert JSON must never expand into a multi-GiB Arrow string
+        # buffer. Dictionary arrays retain every value while sharing storage.
+        # Omit ARROW:schema so readers still see the original string types.
+        options = ({"store_schema": False, "dictionary_pagesize_limit": MAX_ALERT_SPOOL_STRING_BYTES}
+                   if dictionary_strings else {})
+        with pq.ParquetWriter(temporary, schema, compression="zstd", write_statistics=True, **options) as writer:
+            if dictionary_strings and logical_schema.metadata:
+                writer.add_key_value_metadata(logical_schema.metadata)
             while batch := list(islice(iterator, PARQUET_WRITE_BATCH_ROWS)):
-                writer.write_table(rows_to_table(feed_name, batch))
+                table = (rows_to_table(feed_name, batch, dictionary_strings=True)
+                         if dictionary_strings else rows_to_table(feed_name, batch))
+                writer.write_table(table)
         with open(temporary, "rb") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -185,12 +232,16 @@ class DurableParquetSpool:
             return None
         if feed_name not in FEED_NAMES:
             raise ValueError(f"unknown feed: {feed_name}")
-        if feed_name == "alerts":
-            check_alert_spool_size(rows)
         segment_dir = self.spool_dir / feed_name / f"date={date_str}"
         safe_poll_id = "".join(character for character in poll_id if character.isalnum() or character in "-_")
         path = segment_dir / f"batch-{safe_poll_id}-{uuid.uuid4().hex}.json.gz"
-        payload = {"version": 1, "feed": feed_name, "date": date_str, "poll_id": poll_id, "rows": rows}
+        stored_rows, strings = share_large_strings(rows) if feed_name == "alerts" else (rows, [])
+        if feed_name == "alerts":
+            check_alert_spool_size(stored_rows)
+            check_alert_spool_size([{"value": value} for value in strings])
+        payload = {"version": 2 if strings else 1, "feed": feed_name, "date": date_str, "poll_id": poll_id, "rows": stored_rows}
+        if strings:
+            payload["shared_strings"] = strings
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         atomic_write_bytes(path, gzip.compress(encoded, compresslevel=6))
         return path
@@ -199,8 +250,10 @@ class DurableParquetSpool:
     def _read_segment(path: Path) -> list[dict[str, Any]]:
         with gzip.open(path, "rt", encoding="utf-8") as handle:
             payload = json.load(handle)
-        if payload.get("version") != 1 or not isinstance(payload.get("rows"), list):
+        if payload.get("version") not in (1, 2) or not isinstance(payload.get("rows"), list):
             raise ValueError(f"unsupported or corrupt spool segment: {path}")
+        if payload["version"] == 2:
+            return restore_shared_strings(payload["rows"], payload.get("shared_strings"))
         return payload["rows"]
 
     def pending_segments(self) -> list[Path]:

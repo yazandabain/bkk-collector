@@ -289,8 +289,8 @@ class MemoryAndHealthTests(unittest.TestCase):
         from bkk_collector.storage import parquet_store
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/'data.parquet';seen=[];original=parquet_store.rows_to_table
-            def table(feed,rows):
-                seen.append(len(rows));return original(feed,rows)
+            def table(feed,rows,**options):
+                seen.append(len(rows));return original(feed,rows,**options)
             with patch('bkk_collector.storage.parquet_store.rows_to_table',side_effect=table):
                 write_parquet_atomic('alerts',({'entity_id':str(i)} for i in range(10001)),path)
             self.assertLessEqual(max(seen),PARQUET_WRITE_BATCH_ROWS)
