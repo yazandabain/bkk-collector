@@ -140,6 +140,15 @@ gzip-compressed spool segments. Commits decode one segment at a time and write
 at most 4,096 rows per Arrow batch. A successful, validated atomic
 Parquet commit is the only event that removes those segments.
 
+Feed-wide Alerts can name thousands of selectors. Their complete nested JSON
+is still retained in every logical derived row, but large strings are shared
+in version 2 internal spool segments and dictionary-encoded Arrow batches,
+including during compaction. Parquet still reads as the same schema version 2
+string columns; no selector is removed or truncated. Ordinary version 1 spools
+remain readable. Unsafe residual string expansion fails before serialization,
+retains existing spool files and triggers raw fallback plus unhealthy storage
+reporting instead of crashing collection for every feed.
+
 One background Parquet thread is the sole commit/recovery owner; the main
 ingestion thread never waits for its flush, including startup recovery. There
 is no extra in-memory row queue: immutable disk spool segments are the queue.
@@ -527,6 +536,10 @@ as one-off `maintenance` containers, not inside the realtime collector's memory
 cgroup; schedule full-day reports away from a CPU-constrained peak period.
 Background commits overlap ingestion memory. Keep the current limits and
 check real restart/peak-period memory after deployment.
+When reading wide Alerts for research, project only needed columns or request
+dictionary reads for repeated JSON columns, for example
+`pq.ParquetFile(path, read_dictionary=["informed_entities_json"])`. A full plain
+string table can require gigabytes despite a small compressed file.
 Presence journals are protected metadata, not part of raw/Parquet eviction;
 measure their real daily growth and include it in disk/HF capacity planning.
 

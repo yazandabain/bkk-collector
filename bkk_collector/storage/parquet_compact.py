@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 
 from bkk_collector.storage.atomic_io import atomic_write_json, fsync_directory, read_json
-from bkk_collector.storage.parquet_store import parquet_row_count
+from bkk_collector.storage.parquet_store import MAX_ALERT_SPOOL_STRING_BYTES, dictionary_storage_schema, parquet_row_count
 
 
 def _align_table(table, schema):
@@ -73,13 +73,21 @@ def compact_partition(data_dir: Path, feed_name: str, date_str: str, *, min_file
         atomic_write_json(marker, transaction)
 
     schemas = [pq.ParquetFile(path).schema_arrow.remove_metadata() for path in sources]
-    schema = pa.unify_schemas(schemas)
+    logical_schema = pa.unify_schemas(schemas)
+    dictionary_strings = feed_name == "alerts"
+    schema = dictionary_storage_schema(logical_schema) if dictionary_strings else logical_schema
+    string_columns = ([field.name for field in logical_schema if pa.types.is_string(field.type)]
+                      if dictionary_strings else None)
     temporary = directory / f".{output.name}.tmp-{uuid.uuid4().hex}"
     writer = None
     try:
-        writer = pq.ParquetWriter(temporary, schema, compression="zstd", write_statistics=True)
+        options = ({"store_schema": False, "dictionary_pagesize_limit": MAX_ALERT_SPOOL_STRING_BYTES}
+                   if dictionary_strings else {})
+        writer = pq.ParquetWriter(temporary, schema, compression="zstd", write_statistics=True, **options)
         for source in sources:
-            parquet = pq.ParquetFile(source)
+            # Preserve dictionaries through compaction too: plain decoding of
+            # one feed-wide alert can otherwise OOM the maintenance process.
+            parquet = pq.ParquetFile(source, read_dictionary=string_columns)
             for batch in parquet.iter_batches(batch_size=65_536):
                 writer.write_table(_align_table(pa.Table.from_batches([batch]), schema))
         writer.close()
