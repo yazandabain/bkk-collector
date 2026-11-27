@@ -33,8 +33,9 @@ du -sh data/raw data/parquet data/spool data/static_gtfs data/metadata
 ~~~
 
 Preserve untracked files and existing data mounts. Check archive quota and
-recent storage growth: verified retention bounds raw/Parquet caches, not
-protected journals or static history. Do not publish expanded Compose
+recent storage growth. Raw and Parquet have verified cache retention by
+default. Poll/presence evidence and old static ZIPs have separate optional
+retention settings in `.env.example`. Do not publish expanded Compose
 configuration, container environments, or unredacted logs.
 
 ## Preserve rollback assets and test the replacement
