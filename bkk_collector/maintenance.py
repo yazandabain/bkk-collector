@@ -18,6 +18,8 @@ from bkk_collector.archive.backup import BackupManager
 from bkk_collector.config import MaintenanceConfig
 from bkk_collector.collector import configure_logging
 from bkk_collector.archive.manifests import build_daily_manifest
+from bkk_collector.archive.retention import prune_confirmed
+from bkk_collector.archive.static_retention import prune_static_versions
 from bkk_collector.monitoring import poll_journal_path, utc_iso
 from bkk_collector.storage.parquet_compact import compact_partition
 from bkk_collector.archive.static_gtfs import StaticGtfsStore
@@ -115,6 +117,11 @@ class MaintenanceWorker:
         self.last_backup_results = [result.__dict__ for result in results]
         removed = self.backup.prune_confirmed_raw(self.config.prune_local_raw_after_days)
         removed += self.backup.prune_confirmed_parquet(self.config.prune_local_parquet_after_days)
+        removed += prune_confirmed(
+            self.backup, "evidence", self.config.prune_local_evidence_after_days,
+            max_dates=self.config.backup_max_dates_per_run,
+        )
+        removed += prune_static_versions(self.backup, self.config.prune_local_static_gtfs_after_days)
         for path in removed:
             self.logger.info("Pruned local %s after receipt-backed remote verification", path)
 

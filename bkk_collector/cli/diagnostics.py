@@ -214,7 +214,6 @@ def collection_window_report(data_dir: Path, since: float, until: float) -> dict
     if not since < until:
         raise ValueError("window start must precede its end")
     first_date = datetime.fromtimestamp(since, timezone.utc).date()
-    last_date = datetime.fromtimestamp(until, timezone.utc).date()
     status = read_json(data_dir / "health" / "status.json", {})
     report = {"since": utc_iso(since), "until": utc_iso(until), "feeds": {},
               "health": {key: status.get(key) for key in (
@@ -232,7 +231,8 @@ def collection_window_report(data_dir: Path, since: float, until: float) -> dict
                                         "corrupt_lines_in_scanned_partitions"), 0))
         dates = first_date
         success_times, durations, cadences, run_ids = [], [], set(), set()
-        while dates <= last_date:
+        evicted_journal_dates = []
+        while datetime.combine(dates, datetime.min.time(), tzinfo=timezone.utc).timestamp() < until:
             path = poll_journal_path(data_dir, feed_name, dates.isoformat())
             if path.exists():
                 for _line, event in iter_jsonl(path):
@@ -266,6 +266,10 @@ def collection_window_report(data_dir: Path, since: float, until: float) -> dict
                         cadences.add(float(event["poll_interval_seconds"]))
                     if event.get("run_id"):
                         run_ids.add(event["run_id"])
+            else:
+                intent = read_json(data_dir / "maintenance" / f"prune-evidence-{dates}.json", {})
+                if str(path.relative_to(data_dir)) in intent.get("planned_files", []):
+                    evicted_journal_dates.append(dates.isoformat())
             dates += timedelta(days=1)
         cadence = next(iter(cadences)) if len(cadences) == 1 else DEFAULT_FEED_INTERVALS[feed_name]
         expected = (until - since) / cadence
@@ -274,6 +278,7 @@ def collection_window_report(data_dir: Path, since: float, until: float) -> dict
         durations.sort()
         report["feeds"][feed_name] = {
             **dict(counts), "configured_intervals_observed": sorted(cadences), "collector_run_ids": sorted(run_ids),
+            "evicted_journal_dates": evicted_journal_dates,
             "expected_polls_approx": expected if len(cadences) <= 1 else None,
             "successful_data_poll_count_ratio": counts["successful_data_polls"] / expected if len(cadences) <= 1 else None,
             "max_successful_observation_gap_seconds": max(gaps, default=None),
@@ -284,6 +289,13 @@ def collection_window_report(data_dir: Path, since: float, until: float) -> dict
             "processing_ms_max": max(durations, default=None),
             "scheduler_current_run": status.get("scheduler", {}).get(feed_name, {}),
         }
+        if evicted_journal_dates:
+            for field in (
+                "successful_data_poll_count_ratio", "max_successful_observation_gap_seconds",
+                "successful_observation_gaps_over_1_5_cadence",
+                "start_boundary_without_success_seconds", "end_boundary_without_success_seconds",
+            ):
+                report["feeds"][feed_name][field] = None
     return report
 
 

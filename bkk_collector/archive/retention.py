@@ -1,4 +1,4 @@
-"""Verified working-cache eviction. Only the maintenance worker calls this.
+"""Verified eviction of completed per-date cache partitions.
 
 Every check for all three feed partitions finishes before the first unlink.
 Filesystem unlink is not a multi-file transaction: a crash during deletion is
@@ -12,10 +12,23 @@ import fcntl
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from bkk_collector.storage.atomic_io import append_jsonl, atomic_write_json, fsync_directory, read_json, sha256_file
 from bkk_collector.config import FEED_NAMES
 from bkk_collector.monitoring import utc_iso
+
+
+def _partitions(kind: str, date: str) -> dict[str, tuple[str, str]]:
+    if kind == "evidence":
+        return {
+            **{f"metadata/polls/{feed}/date={date}": ("poll_metadata", "polls.jsonl")
+               for feed in FEED_NAMES},
+            f"metadata/tripupdates_presence/date={date}": (
+                "tripupdates_presence", "presence.jsonlog",
+            ),
+        }
+    return {f"{kind}/{feed}/date={date}": (kind, "") for feed in FEED_NAMES}
 
 
 def safe_path(root: Path, relative: str) -> Path:
@@ -33,10 +46,11 @@ def safe_path(root: Path, relative: str) -> Path:
 def _inventory(root: Path, kind: str, date: str) -> dict[str, tuple]:
     result = {}
     for feed in FEED_NAMES:
-        directory = safe_path(root, f"{kind}/{feed}/date={date}")
         spool = safe_path(root, f"spool/{feed}/date={date}")
         if spool.exists() and any(spool.iterdir()):
             raise ValueError("pending spool/recovery work")
+    for relative, (_, primary) in _partitions(kind, date).items():
+        directory = safe_path(root, relative)
         if not directory.exists():
             continue
         for path in directory.iterdir():
@@ -44,19 +58,23 @@ def _inventory(root: Path, kind: str, date: str) -> dict[str, tuple]:
                 raise ValueError(f"unexpected directory/symlink: {path.name}")
             if kind == "parquet" and path.suffix != ".parquet":
                 raise ValueError(f"unexpected Parquet partition entry: {path.name}")
+            if primary and path.name not in (primary, f"{primary}.checkpoint.json"):
+                raise ValueError(f"unexpected observation evidence entry: {path.name}")
             stat = path.stat()
             result[str(path.relative_to(root))] = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
     return result
 
 
-def _prune_date(manager, kind: str, date: str) -> list[Path]:
+def _validated_receipt(
+    manager, date: str,
+) -> tuple[Path, str, dict[str, Any], dict[str, dict[str, Any]], dict[str, Any]]:
     root = manager.data_dir
-    actual = _inventory(root, kind, date)
-    if not actual:
-        return []
     receipt_path = safe_path(root, f"backup_receipts/date={date}.json")
+    if not receipt_path.is_file():
+        raise ValueError("missing or unverified v2 receipt")
+    receipt_sha = sha256_file(receipt_path)
     receipt = read_json(receipt_path, {})
-    if (receipt.get("version") != 2 or receipt.get("date") != date
+    if (not isinstance(receipt, dict) or receipt.get("version") != 2 or receipt.get("date") != date
             or receipt.get("remote_verified") is not True or receipt.get("repo_id") != manager.repo_id):
         raise ValueError("missing or unverified v2 receipt")
     artifacts = receipt.get("artifacts")
@@ -79,19 +97,54 @@ def _prune_date(manager, kind: str, date: str) -> list[Path]:
     if manifest.get("complete") is not True:
         raise ValueError("manifest is incomplete")
     manager._validate_manifest(date, manifest)
-    expected = {name: a for name, a in indexed.items() if a.get("kind") == kind}
-    for feed in FEED_NAMES:
-        prefix = f"{kind}/{feed}/date={date}/"
-        if not any(name.startswith(prefix) for name in expected):
-            raise ValueError(f"receipt lacks {feed} {kind} evidence")
-    for name in expected:
-        parts = Path(name).parts
-        if (len(parts) != 4 or parts[0] != kind or parts[1] not in FEED_NAMES
-                or parts[2] != f"date={date}" or (kind == "parquet" and not name.endswith(".parquet"))):
+    return receipt_path, receipt_sha, receipt, indexed, manifest
+
+
+def _verify_receipt(manager, receipt_path: Path, receipt_sha: str, receipt: dict) -> str:
+    head = manager.remote_revision()
+    revision = receipt.get("remote_revision", head)
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("invalid receipt revision")
+    manager._verify_remote([{
+        "path": str(receipt_path.relative_to(manager.data_dir)), "size": receipt_path.stat().st_size,
+        "sha256": receipt_sha,
+    }], revision=head)
+    return revision
+
+
+def _prune_date(manager, kind: str, date: str) -> list[Path]:
+    root = manager.data_dir
+    actual = _inventory(root, kind, date)
+    if not actual:
+        return []
+    receipt_path, receipt_sha, receipt, indexed, manifest = _validated_receipt(manager, date)
+    partitions = _partitions(kind, date)
+    kinds = {artifact_kind for artifact_kind, _ in partitions.values()}
+    expected = {name: a for name, a in indexed.items() if a.get("kind") in kinds}
+    for name, artifact in expected.items():
+        directory, _, filename = name.rpartition("/")
+        if (directory not in partitions or artifact["kind"] != partitions[directory][0]
+                or (kind == "parquet" and not filename.endswith(".parquet"))):
             raise ValueError("receipt artifact is outside the requested date/kind")
+    for directory, (artifact_kind, primary) in partitions.items():
+        if primary:
+            required = (artifact_kind == "poll_metadata"
+                        or manifest["feeds"]["tripupdates"].get("presence", {}).get("records", 0) > 0)
+            if required and f"{directory}/{primary}" not in expected:
+                raise ValueError(f"receipt lacks required {directory}/{primary}")
+        elif not any(name.rpartition("/")[0] == directory for name in expected):
+            raise ValueError(f"receipt lacks {directory} evidence")
+    if kind == "evidence":
+        if not receipt.get("remote_revision"):
+            raise ValueError("observation evidence requires a pinned receipt")
+        manifest_evidence = {a["path"]: (a["kind"], a["size"], a["sha256"])
+                             for a in manifest["artifacts"] if a["kind"] in kinds}
+        receipt_evidence = {name: (a["kind"], a["size"], a["sha256"])
+                            for name, a in expected.items()}
+        if manifest_evidence != receipt_evidence:
+            raise ValueError("manifest and receipt observation evidence differ")
     if set(actual) - expected.keys():
         raise ValueError("unexpected files absent from receipt")
-    receipt_sha = sha256_file(receipt_path)
     state_path = root / "maintenance" / f"prune-{kind}-{date}.json"
     previous = read_json(state_path, {})
     if expected.keys() - actual.keys():
@@ -103,14 +156,7 @@ def _prune_date(manager, kind: str, date: str) -> list[Path]:
     # Old v2 receipts did not pin a revision. Revalidate their cache objects at
     # a fixed current revision before eviction. Mutable static metadata is not
     # evicted here; full historical restoration uses the original receipt commit.
-    head = manager.remote_revision()
-    revision = receipt.get("remote_revision", head)
-    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise ValueError("invalid receipt revision")
-    manager._verify_remote([{
-        "path": str(receipt_path.relative_to(root)), "size": receipt_path.stat().st_size,
-        "sha256": receipt_sha,
-    }], revision=head)
+    revision = _verify_receipt(manager, receipt_path, receipt_sha, receipt)
     manager._verify_remote(list(expected.values()), revision=revision)
     # Network verification can take time. Recheck ALL local artifacts and the
     # directory inventory before authorizing any deletion.
@@ -144,8 +190,8 @@ def _prune_date(manager, kind: str, date: str) -> list[Path]:
     return removed
 
 
-def prune_confirmed(manager, kind: str, after_days: int) -> list[Path]:
-    if kind not in ("raw", "parquet"):
+def prune_confirmed(manager, kind: str, after_days: int, *, max_dates: int | None = None) -> list[Path]:
+    if kind not in ("raw", "parquet", "evidence"):
         raise ValueError("unsupported prune operation")
     if after_days <= 0 or not manager.enabled:
         return []
@@ -158,11 +204,17 @@ def prune_confirmed(manager, kind: str, after_days: int) -> list[Path]:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return []
+        pruned_dates = 0
         for date in sorted(manager.confirmed_dates()):
+            if max_dates is not None and pruned_dates >= max_dates:
+                break
             try:
                 if datetime.strptime(date, "%Y-%m-%d").date() >= cutoff:
                     continue
-                removed.extend(_prune_date(manager, kind, date))
+                paths = _prune_date(manager, kind, date)
+                if paths:
+                    removed.extend(paths)
+                    pruned_dates += 1
             except Exception as error:
                 # Refusal protects data; keep maintenance running and retry.
                 # API errors may include credential-bearing URLs, so no trace.

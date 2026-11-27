@@ -12,6 +12,10 @@ from unittest.mock import Mock, patch
 
 import pyarrow.parquet as pq
 
+from bkk_collector.archive.retention import prune_confirmed
+from bkk_collector.archive.static_gtfs import StaticGtfsStore
+from bkk_collector.archive.static_retention import prune_static_versions
+from bkk_collector.cli.diagnostics import collection_window_report
 from bkk_collector.storage.atomic_io import atomic_write_json, read_json, sha256_file
 from bkk_collector.config import FEED_NAMES, MaintenanceConfig
 from bkk_collector.realtime.dedup import ChangeTracker
@@ -59,6 +63,125 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual('complete', event['status'])
         self.assertEqual(3, len(event['files_deleted']))
         self.assertEqual(sum(a['size'] for a in self.complete_manifest['artifacts'] if a['kind']=='parquet'), event['bytes_deleted'])
+
+    def add_artifact(self, relative, kind, payload):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        self.complete_manifest["artifacts"].append({
+            "path": relative, "kind": kind, "size": len(payload), "sha256": sha256_file(path),
+        })
+        return path
+
+    def prepare_evidence(self):
+        self.add_artifact(f"metadata/tripupdates_presence/date={self.date}/presence.jsonlog",
+                          "tripupdates_presence", b"presence")
+        self.add_artifact(f"metadata/polls/alerts/date={self.date}/polls.jsonl.checkpoint.json",
+                          "poll_metadata", b"checkpoint")
+        self.complete_manifest["feeds"]["tripupdates"]["presence"] = {
+            "records": 1, "journal_confirmed_observations": 1,
+        }
+        atomic_write_json(self.manifest_path, self.complete_manifest)
+        self.ready()
+
+    def test_verified_evidence_eviction_preserves_all_other_artifacts_and_reports_absence(self):
+        self.prepare_evidence()
+        before = self.hashes()
+        files = {a["path"] for a in self.complete_manifest["artifacts"]
+                 if a["kind"] in {"poll_metadata", "tripupdates_presence"}}
+        self.assertEqual(files, {str(p.relative_to(self.root)) for p in
+                                 prune_confirmed(self.backup, "evidence", 30)})
+        self.assertEqual({k: v for k, v in before.items() if k not in files}, self.hashes())
+        self.assertEqual([], prune_confirmed(self.backup, "evidence", 30))
+        start = datetime.fromisoformat(self.date).replace(tzinfo=timezone.utc).timestamp()
+        report = collection_window_report(self.root, start, start + 86400)
+        for feed in report["feeds"].values():
+            self.assertEqual([self.date], feed["evicted_journal_dates"])
+            self.assertIsNone(feed["successful_data_poll_count_ratio"])
+
+    def test_evidence_prune_refuses_entire_date_on_unbacked_tail_or_remote_mismatch(self):
+        self.prepare_evidence()
+        extra = self.root / f"metadata/polls/alerts/date={self.date}/polls.jsonl.corrupt-tail-test"
+        extra.write_bytes(b"forensic evidence")
+        before = self.hashes()
+        self.assertEqual([], prune_confirmed(self.backup, "evidence", 30))
+        self.assertEqual(before, self.hashes())
+        extra.unlink()
+        revision = read_json(self.receipt, {})["remote_revision"]
+        target = f"metadata/tripupdates_presence/date={self.date}/presence.jsonlog"
+        del self.api.revisions[revision][target]
+        before = self.hashes()
+        self.assertEqual([], prune_confirmed(self.backup, "evidence", 30))
+        self.assertEqual(before, self.hashes())
+
+    def test_evidence_prune_refuses_unpinned_receipt(self):
+        self.prepare_evidence()
+        receipt = read_json(self.receipt, {})
+        receipt.pop("remote_revision")
+        atomic_write_json(self.receipt, receipt)
+        self.api.upload_file(path_in_repo=str(self.receipt.relative_to(self.root)),
+                             path_or_fileobj=self.receipt)
+        before = self.hashes()
+        self.assertEqual([], prune_confirmed(self.backup, "evidence", 30))
+        self.assertEqual(before, self.hashes())
+
+    def prepare_static_versions(self):
+        today = datetime.now(timezone.utc).date()
+        old_date = self.date
+        versions = {}
+        for role, age in (("evict", 80), ("pending", 70), ("boundary", 35), ("active", 2)):
+            payload = role.encode()
+            digest = hashlib.sha256(payload).hexdigest()
+            relative = f"versions/{digest}.zip"
+            versions[role] = self.add_artifact(f"static_gtfs/{relative}", "static_gtfs", payload)
+            append_jsonl(self.root / "static_gtfs/history.jsonl", {
+                "checked_at": f"{today - timedelta(days=age)}T00:00:00+00:00",
+                "version_path": relative, "sha256": digest,
+            })
+        self.date = (today - timedelta(days=1)).isoformat()
+        self.complete_manifest["date"] = self.date
+        # Create a complete receipt dated just before today with the test
+        # versions as extra static artifacts and today's observed timeline.
+        for artifact in self.complete_manifest["artifacts"]:
+            if f"date={old_date}/" in artifact["path"]:
+                old = self.root / artifact["path"]
+                artifact["path"] = artifact["path"].replace(f"date={old_date}/", f"date={self.date}/")
+                target = self.root / artifact["path"]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                old.rename(target)
+                old.parent.rmdir()
+        for item in [self.complete_manifest["static_gtfs"], *self.complete_manifest["static_gtfs_timeline"]]:
+            item.update(version_path=f"versions/{versions['active'].name}",
+                        sha256=versions["active"].stem)
+        self.manifest_path = self.root / f"metadata/manifests/date={self.date}.json"
+        atomic_write_json(self.manifest_path, self.complete_manifest)
+        atomic_write_json(self.root / "static_gtfs/state.json", {
+            "latest_version_path": f"versions/{versions['active'].name}",
+            "latest_sha256": versions["active"].stem,
+        })
+        self.ready()
+        self.backup.static_store = StaticGtfsStore(self.root, check_interval_seconds=86400, retry_seconds=60)
+        pending = today - timedelta(days=65)
+        journal = self.root / f"metadata/polls/alerts/date={pending}/polls.jsonl"
+        journal.parent.mkdir(parents=True)
+        journal.write_bytes(b"unconfirmed date")
+        return versions
+
+    def test_static_eviction_keeps_active_boundary_pending_and_legacy_archives(self):
+        versions = self.prepare_static_versions()
+        before = self.hashes()
+        self.assertEqual([versions["evict"]], prune_static_versions(self.backup, 30))
+        del before[str(versions["evict"].relative_to(self.root))]
+        self.assertEqual(before, self.hashes())
+        self.assertEqual([], prune_static_versions(self.backup, 30))
+
+    def test_static_eviction_refuses_when_pinned_archive_is_missing(self):
+        versions = self.prepare_static_versions()
+        revision = read_json(self.receipt, {})["remote_revision"]
+        del self.api.revisions[revision][str(versions["evict"].relative_to(self.root))]
+        before = self.hashes()
+        self.assertEqual([], prune_static_versions(self.backup, 30))
+        self.assertEqual(before, self.hashes())
 
     def test_current_and_inside_retention_dates_never_prune(self):
         self.ready()
@@ -242,6 +365,13 @@ class MemoryAndHealthTests(unittest.TestCase):
             config=MaintenanceConfig.from_env()
             self.assertEqual(3,config.prune_local_raw_after_days)
             self.assertEqual(7,config.prune_local_parquet_after_days)
+            self.assertEqual(0, config.prune_local_evidence_after_days)
+            self.assertEqual(0, config.prune_local_static_gtfs_after_days)
+        with patch.dict('os.environ', {'PRUNE_LOCAL_EVIDENCE_AFTER_DAYS': '30',
+                                      'PRUNE_LOCAL_STATIC_GTFS_AFTER_DAYS': '45'}):
+            config = MaintenanceConfig.from_env()
+            self.assertEqual(30, config.prune_local_evidence_after_days)
+            self.assertEqual(45, config.prune_local_static_gtfs_after_days)
         with patch.dict('os.environ',{'PRUNE_LOCAL_PARQUET_AFTER_DAYS':'0'}):
             self.assertEqual(0,MaintenanceConfig.from_env().prune_local_parquet_after_days)
         with self.assertRaisesRegex(ValueError,'PRUNE_LOCAL_PARQUET'):
