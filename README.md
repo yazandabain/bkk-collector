@@ -405,11 +405,25 @@ Old v2 receipts lacking a revision are resolved to the historical
 receipt-upload commit and checked against the local receipt hash. Restoring
 old static metadata from HF `main` is incorrect: those paths are mutable.
 
-Verified retention bounds raw/Parquet caches only when backup succeeds.
-Protected static versions, poll journals, and presence logs continue growing.
-Size local disk and remote archive capacity from observed daily growth,
-retention windows, and the planned collection duration. Check the actual
-free-space and archive-quota trends regularly.
+Two optional settings extend the verified local cache policy.
+`PRUNE_LOCAL_EVIDENCE_AFTER_DAYS=30` evicts poll journals, TripUpdates presence
+logs and their checkpoints for completed dates older than 30 days. It requires
+an authenticated manifest and a pinned receipt whose evidence inventory and
+checksums match. Unexpected files, including detached forensic tails, retain the
+date. `collection-window` lists evicted journal dates and withholds coverage
+ratios and gap metrics for affected windows.
+
+`PRUNE_LOCAL_STATIC_GTFS_AFTER_DAYS=30` evicts older content-addressed ZIPs
+verified against the latest completed backup's pinned receipt. Versions needed
+by the retained window or an unfinished backup stay local, as do legacy dated
+ZIPs. Both settings default to `0` (keep locally). Manifests, receipts,
+collector run records, and static observation history remain local. For older
+research windows, restore the required artifacts from the revision in their
+receipt into a separate analysis directory.
+
+Local eviction depends on successful backup and remote verification. Size the
+disk and remote archive for the observed growth, retention windows, and backup
+outage headroom. Check free-space and archive-quota trends regularly.
 
 Hugging Face is one off-server copy, not a complete 3-2-1 backup strategy. For
 irreplaceable research, periodically replicate the dataset repo to a second
@@ -580,6 +594,8 @@ variables all have safe defaults; the most important are:
 | `BACKUP_RETRY_SECONDS` | `900` | pending backlog retry interval |
 | `PRUNE_LOCAL_RAW_AFTER_DAYS` | `3` | verified raw retention; `0` disables |
 | `PRUNE_LOCAL_PARQUET_AFTER_DAYS` | `7` | verified Parquet retention; `0` disables |
+| `PRUNE_LOCAL_EVIDENCE_AFTER_DAYS` | `0` | verified retention for poll journals and TripUpdates presence |
+| `PRUNE_LOCAL_STATIC_GTFS_AFTER_DAYS` | `0` | verified retention for older static GTFS ZIPs |
 | `STATIC_GTFS_CHECK_INTERVAL_SECONDS` | `86400` | successful static check interval |
 | `FEED_STALE_SECONDS` | `180` | source timestamp age limit |
 | `FEED_ABSENT_SECONDS` | `180` | no-success limit |

@@ -237,6 +237,8 @@ class MaintenanceConfig:
     compact_parquet: bool = True
     compaction_min_files: int = 12
     backup_stale_hours: float = 48.0
+    prune_local_evidence_after_days: int = 0
+    prune_local_static_gtfs_after_days: int = 0
 
     def __post_init__(self) -> None:
         if not 0 <= self.backup_hour_utc <= 23:
@@ -261,6 +263,10 @@ class MaintenanceConfig:
             raise ValueError("PRUNE_LOCAL_RAW_AFTER_DAYS must not be negative")
         if self.prune_local_parquet_after_days < 0:
             raise ValueError("PRUNE_LOCAL_PARQUET_AFTER_DAYS must not be negative")
+        if self.prune_local_evidence_after_days < 0:
+            raise ValueError("PRUNE_LOCAL_EVIDENCE_AFTER_DAYS must not be negative")
+        if self.prune_local_static_gtfs_after_days < 0:
+            raise ValueError("PRUNE_LOCAL_STATIC_GTFS_AFTER_DAYS must not be negative")
         if self.compaction_min_files < 2:
             raise ValueError("PARQUET_COMPACTION_MIN_FILES must be at least 2")
 
@@ -284,4 +290,6 @@ class MaintenanceConfig:
             compact_parquet=env_bool("PARQUET_COMPACTION_ENABLED", True),
             compaction_min_files=int(os.environ.get("PARQUET_COMPACTION_MIN_FILES", "12")),
             backup_stale_hours=float(os.environ.get("BACKUP_STALE_HOURS", "48")),
+            prune_local_evidence_after_days=int(os.environ.get("PRUNE_LOCAL_EVIDENCE_AFTER_DAYS", "0")),
+            prune_local_static_gtfs_after_days=int(os.environ.get("PRUNE_LOCAL_STATIC_GTFS_AFTER_DAYS", "0")),
         )
